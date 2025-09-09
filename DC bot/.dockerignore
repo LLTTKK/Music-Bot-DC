@@ -1,0 +1,17 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+env
+venv
+build
+dist
+*.log
+node_modules
+cookies.txt
+**/cookies/*.txt
+
+
