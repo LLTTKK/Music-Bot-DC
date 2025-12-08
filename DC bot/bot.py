@@ -18,6 +18,7 @@ import unicodedata
 import re
 import urllib.parse
 from functools import wraps
+import logging
 # Spotify 支援（無需 API 登入）
 # 機器人配置 - 從環境變數讀取
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -91,6 +92,11 @@ def _resolve_cookies_file():
     except Exception as e:
         print(f"❌ cookies 檔案檢查錯誤: {e}")
     return None
+
+# 設定語音連接日誌
+logging.basicConfig(level=logging.INFO)
+discord_logger = logging.getLogger('discord.voice_client')
+discord_logger.setLevel(logging.DEBUG)
 
 # 設定機器人權限意圖
 intents = discord.Intents.default()
@@ -1181,6 +1187,56 @@ def stop_current_playback(guild_id):
         return True
     return False
 
+async def connect_to_voice_channel(guild, voice_channel, channel):
+    """
+    統一的語音頻道連接函數，包含重試機制和錯誤處理
+    """
+    voice_client = discord.utils.get(bot.voice_clients, guild=guild)
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            if not voice_client or not voice_client.is_connected():
+                # 設定語音連接參數
+                voice_client = await voice_channel.connect(
+                    timeout=30.0,
+                    reconnect=True,
+                    self_deaf=True
+                )
+            elif voice_client.channel != voice_channel:
+                await voice_client.move_to(voice_channel)
+            return voice_client  # 成功連接，返回 voice_client
+            
+        except discord.errors.ClientException as e:
+            if "already connected" in str(e).lower():
+                # 如果已經連接，嘗試斷開重連
+                try:
+                    await voice_client.disconnect(force=True)
+                    await asyncio.sleep(2)
+                    voice_client = await voice_channel.connect(
+                        timeout=30.0,
+                        reconnect=True,
+                        self_deaf=True
+                    )
+                    return voice_client
+                except Exception:
+                    pass
+            retry_count += 1
+            if retry_count >= max_retries:
+                await channel.send(f"加入語音頻道失敗 (已重試 {max_retries} 次): {e}\nFailed to join voice channel (retried {max_retries} times): {e}")
+                return None
+            await asyncio.sleep(2)  # 等待 2 秒後重試
+            
+        except Exception as e:
+            retry_count += 1
+            if retry_count >= max_retries:
+                await channel.send(f"加入語音頻道失敗 (已重試 {max_retries} 次): {e}\nFailed to join voice channel (retried {max_retries} times): {e}")
+                return None
+            await asyncio.sleep(2)  # 等待 2 秒後重試
+    
+    return None
+
 # 用於互動式選單的 View
 class YoutubeSelectView(discord.ui.View):
     def __init__(self, user, results, voice_channel, message, voice_client):
@@ -1357,14 +1413,8 @@ async def on_message(message):
             return
 
         # 加入語音頻道
-        voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
-        try:
-            if not voice_client or not voice_client.is_connected():
-                voice_client = await voice_channel.connect(reconnect=False)
-            elif voice_client.channel != voice_channel:
-                await voice_client.move_to(voice_channel)
-        except Exception as e:
-            await message.channel.send(f"加入語音頻道失敗: {e}\nFailed to join voice channel: {e}")
+        voice_client = await connect_to_voice_channel(message.guild, voice_channel, message.channel)
+        if not voice_client:
             return
 
         # 根據平台處理音樂
@@ -1485,14 +1535,8 @@ async def on_message(message):
             return
 
         # 加入語音頻道
-        voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
-        try:
-            if not voice_client or not voice_client.is_connected():
-                voice_client = await voice_channel.connect(reconnect=False)
-            elif voice_client.channel != voice_channel:
-                await voice_client.move_to(voice_channel)
-        except Exception as e:
-            await message.channel.send(f"加入語音頻道失敗: {e}\nFailed to join voice channel: {e}")
+        voice_client = await connect_to_voice_channel(message.guild, voice_channel, message.channel)
+        if not voice_client:
             return
 
         # 判斷是網址還是關鍵字
@@ -1629,14 +1673,8 @@ async def on_message(message):
             return
 
         # 加入語音頻道
-        voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
-        try:
-            if not voice_client or not voice_client.is_connected():
-                voice_client = await voice_channel.connect(reconnect=False)
-            elif voice_client.channel != voice_channel:
-                await voice_client.move_to(voice_channel)
-        except Exception as e:
-            await message.channel.send(f"加入語音頻道失敗: {e}\nFailed to join voice channel: {e}")
+        voice_client = await connect_to_voice_channel(message.guild, voice_channel, message.channel)
+        if not voice_client:
             return
 
         # 判斷是網址還是關鍵字
@@ -2309,14 +2347,8 @@ async def play_url(ctx, url: str):
         return
 
     # 加入語音頻道
-    voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
-    try:
-        if not voice_client or not voice_client.is_connected():
-            voice_client = await voice_channel.connect(reconnect=False)
-        elif voice_client.channel != voice_channel:
-            await voice_client.move_to(voice_channel)
-    except Exception as e:
-        await ctx.send(f"加入語音頻道失敗: {e}\nFailed to join voice channel: {e}")
+    voice_client = await connect_to_voice_channel(ctx.guild, voice_channel, ctx)
+    if not voice_client:
         return
 
     # 根據平台處理音樂
