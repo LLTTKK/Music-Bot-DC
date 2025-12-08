@@ -466,6 +466,23 @@ async def on_ready():
     print(f'已登入為 {bot.user}')
     print(f'Application ID: {APPLICATION_ID}')
     
+    # 清理任何現有的語音連接（防止 4006 錯誤）
+    print('🔄 清理現有語音連接...')
+    for vc in bot.voice_clients:
+        try:
+            await vc.disconnect(force=True)
+            print(f'  - 已斷開 {vc.guild.name} 的語音連接')
+        except Exception as e:
+            print(f'  - 清理失敗: {e}')
+    
+    # 清空播放佇列和狀態
+    song_queues.clear()
+    loop_states.clear()
+    ad_filter_players.clear()
+    disconnect_reasons.clear()
+    last_music_channels.clear()
+    print('✅ 語音連接和播放狀態已清理')
+    
     # 檢查伺服器限制
     if ALLOWED_SERVER_ID:
         allowed_guild = bot.get_guild(int(ALLOWED_SERVER_ID))
@@ -485,6 +502,7 @@ async def on_ready():
             print(f'❌ 警告：找不到指定的頻道 ID: {ALLOWED_CHANNEL_ID}')
     
     await update_log_channel_cache()
+    print('🤖 機器人已準備就緒！')
 
 @bot.event
 async def on_voice_state_update(member, before, after):
@@ -1190,50 +1208,106 @@ def stop_current_playback(guild_id):
 async def connect_to_voice_channel(guild, voice_channel, channel):
     """
     統一的語音頻道連接函數，包含重試機制和錯誤處理
+    特別處理 WebSocket 4006 錯誤（Session no longer valid）
     """
-    voice_client = discord.utils.get(bot.voice_clients, guild=guild)
     max_retries = 3
     retry_count = 0
     
     while retry_count < max_retries:
         try:
-            if not voice_client or not voice_client.is_connected():
-                # 設定語音連接參數
+            # 先清理任何現有的語音連接
+            voice_client = discord.utils.get(bot.voice_clients, guild=guild)
+            
+            # 如果已經有連接但狀態不正確，先清理
+            if voice_client:
+                if not voice_client.is_connected():
+                    # 連接對象存在但未連接，強制清理
+                    try:
+                        await voice_client.disconnect(force=True)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+                    voice_client = None
+                elif voice_client.channel == voice_channel:
+                    # 已經在正確的頻道，直接返回
+                    return voice_client
+                else:
+                    # 在不同頻道，移動過去
+                    try:
+                        await voice_client.move_to(voice_channel)
+                        return voice_client
+                    except Exception as move_error:
+                        print(f"移動到語音頻道失敗: {move_error}")
+                        # 移動失敗，嘗試斷開重連
+                        try:
+                            await voice_client.disconnect(force=True)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1)
+                        voice_client = None
+            
+            # 嘗試新連接
+            if not voice_client:
+                print(f"🎤 嘗試連接語音頻道 (第 {retry_count + 1} 次)...")
                 voice_client = await voice_channel.connect(
-                    timeout=30.0,
+                    timeout=60.0,  # 增加超時時間
                     reconnect=True,
                     self_deaf=True
                 )
-            elif voice_client.channel != voice_channel:
-                await voice_client.move_to(voice_channel)
-            return voice_client  # 成功連接，返回 voice_client
+                print(f"✅ 語音連接成功: {voice_channel.name}")
+                return voice_client
             
         except discord.errors.ClientException as e:
-            if "already connected" in str(e).lower():
+            error_msg = str(e).lower()
+            print(f"❌ ClientException: {e}")
+            
+            if "already connected" in error_msg:
                 # 如果已經連接，嘗試斷開重連
                 try:
-                    await voice_client.disconnect(force=True)
+                    voice_client = discord.utils.get(bot.voice_clients, guild=guild)
+                    if voice_client:
+                        await voice_client.disconnect(force=True)
                     await asyncio.sleep(2)
-                    voice_client = await voice_channel.connect(
-                        timeout=30.0,
-                        reconnect=True,
-                        self_deaf=True
-                    )
-                    return voice_client
                 except Exception:
                     pass
+            
             retry_count += 1
             if retry_count >= max_retries:
                 await channel.send(f"加入語音頻道失敗 (已重試 {max_retries} 次): {e}\nFailed to join voice channel (retried {max_retries} times): {e}")
                 return None
-            await asyncio.sleep(2)  # 等待 2 秒後重試
+            print(f"⏳ 等待 3 秒後重試...")
+            await asyncio.sleep(3)
             
         except Exception as e:
+            error_msg = str(e)
+            print(f"❌ 語音連接錯誤: {e}")
+            
+            # 特別處理 WebSocket 4006 錯誤
+            if "4006" in error_msg or "WebSocket" in error_msg:
+                print("⚠️ 檢測到 WebSocket 錯誤，嘗試完全重置連接...")
+                try:
+                    # 清理所有現有連接
+                    voice_client = discord.utils.get(bot.voice_clients, guild=guild)
+                    if voice_client:
+                        try:
+                            voice_client.cleanup()
+                        except Exception:
+                            pass
+                        try:
+                            await voice_client.disconnect(force=True)
+                        except Exception:
+                            pass
+                    # 等待更長時間讓 Discord 清理會話
+                    await asyncio.sleep(5)
+                except Exception as cleanup_error:
+                    print(f"清理連接時出錯: {cleanup_error}")
+            
             retry_count += 1
             if retry_count >= max_retries:
                 await channel.send(f"加入語音頻道失敗 (已重試 {max_retries} 次): {e}\nFailed to join voice channel (retried {max_retries} times): {e}")
                 return None
-            await asyncio.sleep(2)  # 等待 2 秒後重試
+            print(f"⏳ 等待 3 秒後重試...")
+            await asyncio.sleep(3)
     
     return None
 
