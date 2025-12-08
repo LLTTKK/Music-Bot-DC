@@ -1249,6 +1249,13 @@ async def connect_to_voice_channel(guild, voice_channel, channel):
             # 嘗試新連接
             if not voice_client:
                 print(f"🎤 嘗試連接語音頻道 (第 {retry_count + 1} 次)...")
+                
+                # 在連接前等待一下，避免連接太快導致 4006 錯誤
+                if retry_count > 0:
+                    wait_before_connect = 3 + (retry_count * 2)  # 第一次重試 5 秒，之後每次增加 2 秒
+                    print(f"⏳ 連接前等待 {wait_before_connect} 秒...")
+                    await asyncio.sleep(wait_before_connect)
+                
                 # 禁用自動重連以避免 4006 錯誤衝突
                 voice_client = await voice_channel.connect(
                     timeout=60.0,  # 增加超時時間
@@ -1256,8 +1263,17 @@ async def connect_to_voice_channel(guild, voice_channel, channel):
                     self_deaf=False,  # 不禁用音頻輸入（如果需要語音指令）
                     self_mute=False   # 不禁用麥克風
                 )
-                print(f"✅ 語音連接成功: {voice_channel.name}")
-                return voice_client
+                
+                # 連接後等待一下確認連接穩定
+                await asyncio.sleep(2)
+                
+                # 再次檢查連接狀態
+                if voice_client.is_connected():
+                    print(f"✅ 語音連接成功: {voice_channel.name}")
+                    return voice_client
+                else:
+                    print(f"⚠️ 連接後狀態檢查失敗，連接可能不穩定")
+                    raise Exception("Connection established but not stable")
             
         except discord.errors.ClientException as e:
             error_msg = str(e).lower()
@@ -1306,8 +1322,10 @@ async def connect_to_voice_channel(guild, voice_channel, channel):
             if "4006" in error_msg or "WebSocket" in error_msg or "ConnectionClosed" in error_msg:
                 print("⚠️ 檢測到 WebSocket 4006 錯誤，檢查連接狀態...")
                 
+                # 等待更長時間讓 Discord 處理連接（4006 錯誤後連接可能需要時間建立）
+                await asyncio.sleep(5)  # 增加等待時間到 5 秒
+                
                 # 再次檢查連接狀態（4006 錯誤後連接可能已建立）
-                await asyncio.sleep(2)  # 等待一下讓連接完成
                 voice_client = discord.utils.get(bot.voice_clients, guild=guild)
                 if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
                     print(f"✅ 4006 錯誤後連接已成功建立: {voice_channel.name}")
@@ -1328,7 +1346,7 @@ async def connect_to_voice_channel(guild, voice_channel, channel):
                         except Exception:
                             pass
                     # 等待更長時間讓 Discord 完全清理會話（4006 需要更長等待）
-                    wait_time = 10 + (retry_count * 5)  # 第一次 10 秒，之後每次增加 5 秒
+                    wait_time = 15 + (retry_count * 5)  # 第一次 15 秒，之後每次增加 5 秒
                     print(f"⏳ 等待 {wait_time} 秒讓 Discord 清理會話...")
                     await asyncio.sleep(wait_time)
                 except Exception as cleanup_error:
