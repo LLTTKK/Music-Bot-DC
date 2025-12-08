@@ -131,8 +131,12 @@ ad_filter_players = {}
 loop_states = {}
 
 # 全域變數：語音斷線原因（每個 guild 一個）
-# 用途：在 on_voice_state_update 區分「播放完自動離線 / 使用者要求 / 強制斷線」
+# 用途：在 on_voice_state_update 區分「播放完自動離線 / 使用者要求 / 強制斷線 / 連接失敗」
 disconnect_reasons = {}
+
+# 全域變數：連接失敗標記（每個 guild 一個）
+# 用途：標記連接失敗，避免誤報為"被強制斷開"
+connection_failures = {}
 
 # 全域變數：最後使用的音樂文字頻道（每個 guild 一個）
 last_music_channels = {}
@@ -554,14 +558,24 @@ async def on_voice_state_update(member, before, after):
                             await music_channel.send(msg)
                     except Exception:
                         pass
+                elif reason == 'connection_failed':
+                    # 連接失敗，不顯示訊息（避免誤報）
+                    print(f"⚠️ 連接失敗（4006 錯誤），不顯示訊息給用戶")
+                    pass
                 else:
-                    msg = "⚠️ Bot 被強制斷開語音，已停用重連並清空播放佇列。"
-                    await log_action(guild, msg)
-                    try:
-                        if music_channel:
-                            await music_channel.send(msg)
-                    except Exception:
-                        pass
+                    # 只有在沒有連接失敗標記時才顯示"被強制斷開"
+                    if guild.id not in connection_failures:
+                        msg = "⚠️ Bot 被強制斷開語音，已停用重連並清空播放佇列。"
+                        await log_action(guild, msg)
+                        try:
+                            if music_channel:
+                                await music_channel.send(msg)
+                        except Exception:
+                            pass
+                    else:
+                        # 清除連接失敗標記
+                        connection_failures.pop(guild.id, None)
+                        print(f"⚠️ 連接失敗，已清除標記")
     except Exception:
         pass
 
@@ -1301,6 +1315,9 @@ async def connect_to_voice_channel(guild, voice_channel, channel):
             
             retry_count += 1
             if retry_count >= max_retries:
+                # 標記連接失敗
+                connection_failures[guild.id] = True
+                disconnect_reasons[guild.id] = 'connection_failed'
                 await channel.send(f"加入語音頻道失敗 (已重試 {max_retries} 次): {e}\nFailed to join voice channel (retried {max_retries} times): {e}")
                 return None
             # 4006 錯誤需要更長等待時間
@@ -1354,10 +1371,17 @@ async def connect_to_voice_channel(guild, voice_channel, channel):
             
             retry_count += 1
             if retry_count >= max_retries:
+                # 標記連接失敗
+                connection_failures[guild.id] = True
+                disconnect_reasons[guild.id] = 'connection_failed'
+                
                 # 最後一次檢查連接狀態
+                await asyncio.sleep(5)  # 增加等待時間
                 voice_client = discord.utils.get(bot.voice_clients, guild=guild)
                 if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
                     print(f"✅ 最終檢查：連接已成功建立: {voice_channel.name}")
+                    connection_failures.pop(guild.id, None)  # 清除標記
+                    disconnect_reasons.pop(guild.id, None)  # 清除原因
                     return voice_client
                 
                 await channel.send(f"加入語音頻道失敗 (已重試 {max_retries} 次): {e}\nFailed to join voice channel (retried {max_retries} times): {e}")
@@ -1367,6 +1391,20 @@ async def connect_to_voice_channel(guild, voice_channel, channel):
             print(f"⏳ 等待 {wait_time} 秒後重試...")
             await asyncio.sleep(wait_time)
     
+    # 最後一次檢查：即使所有重試都失敗，也檢查連接是否已建立
+    print("🔍 進行最後一次連接狀態檢查...")
+    await asyncio.sleep(5)  # 增加等待時間到 5 秒
+    voice_client = discord.utils.get(bot.voice_clients, guild=guild)
+    if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
+        print(f"✅ 最後檢查：連接已成功建立: {voice_channel.name}")
+        connection_failures.pop(guild.id, None)  # 清除標記
+        disconnect_reasons.pop(guild.id, None)  # 清除原因
+        return voice_client
+    
+    print("❌ 所有重試都失敗，連接未建立")
+    # 確保標記已設置
+    connection_failures[guild.id] = True
+    disconnect_reasons[guild.id] = 'connection_failed'
     return None
 
 # 用於互動式選單的 View
@@ -1547,7 +1585,13 @@ async def on_message(message):
         # 加入語音頻道
         voice_client = await connect_to_voice_channel(message.guild, voice_channel, message.channel)
         if not voice_client:
-            return
+            # 即使函數返回 None，也再次檢查連接狀態（4006 錯誤後連接可能已建立）
+            await asyncio.sleep(2)
+            voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
+            if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
+                print(f"✅ 連接檢查：連接已成功建立: {voice_channel.name}")
+            else:
+                return
 
         # 根據平台處理音樂
         try:
@@ -1669,7 +1713,13 @@ async def on_message(message):
         # 加入語音頻道
         voice_client = await connect_to_voice_channel(message.guild, voice_channel, message.channel)
         if not voice_client:
-            return
+            # 即使函數返回 None，也再次檢查連接狀態（4006 錯誤後連接可能已建立）
+            await asyncio.sleep(2)
+            voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
+            if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
+                print(f"✅ 連接檢查：連接已成功建立: {voice_channel.name}")
+            else:
+                return
 
         # 判斷是網址還是關鍵字
         if query.startswith("http://") or query.startswith("https://"):
@@ -1807,7 +1857,13 @@ async def on_message(message):
         # 加入語音頻道
         voice_client = await connect_to_voice_channel(message.guild, voice_channel, message.channel)
         if not voice_client:
-            return
+            # 即使函數返回 None，也再次檢查連接狀態（4006 錯誤後連接可能已建立）
+            await asyncio.sleep(2)
+            voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
+            if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
+                print(f"✅ 連接檢查：連接已成功建立: {voice_channel.name}")
+            else:
+                return
 
         # 判斷是網址還是關鍵字
         if query.startswith("http://") or query.startswith("https://"):
@@ -2481,7 +2537,13 @@ async def play_url(ctx, url: str):
     # 加入語音頻道
     voice_client = await connect_to_voice_channel(ctx.guild, voice_channel, ctx)
     if not voice_client:
-        return
+        # 即使函數返回 None，也再次檢查連接狀態（4006 錯誤後連接可能已建立）
+        await asyncio.sleep(2)
+        voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
+        if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
+            print(f"✅ 連接檢查：連接已成功建立: {voice_channel.name}")
+        else:
+            return
 
     # 根據平台處理音樂
     try:
