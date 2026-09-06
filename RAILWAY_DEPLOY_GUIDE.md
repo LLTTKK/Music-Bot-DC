@@ -44,13 +44,16 @@
    HARD_ADMIN_USER_IDS=123456789012345678,987654321098765432
    ```
 
-3. 可選的進階設定：
+3. YouTube 播放（Railway 幾乎必設）：
    ```
-   YTDLP_COOKIES_FILE=cookies.txt
+   # 把本機匯出的 Netscape cookies.txt 全文貼上（推薦）
+   YTDLP_COOKIES=
+   # 或 base64 編碼後貼上
+   YTDLP_COOKIES_BASE64=
+   # 可選：住宅代理（cookies 仍被擋時）
    YTDLP_PROXY=
-   YTDLP_YT_ANDROID_PO_TOKEN=
-   YTDLP_YT_IOS_PO_TOKEN=
    ```
+   若日誌出現 `Sign in to confirm you’re not a bot` / `cookies.txt 不存在`，代表雲端 IP 被 YouTube bot-check，沒有 cookies 就無法播放。
 
 **詳細設定說明請參考 [Railway 環境變數設定指南](RAILWAY_ENV_SETUP.md)**
 

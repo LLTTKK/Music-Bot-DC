@@ -142,6 +142,58 @@ def _build_youtube_extractor_args(player_clients):
         youtube_args['po_token'] = po_tokens
     return {'youtube': youtube_args}
 
+
+def _is_youtube_botcheck_error(err) -> bool:
+    msg = str(err).lower()
+    needles = [
+        'sign in to confirm',
+        "confirm you're not a bot",
+        'confirm you are not a bot',
+        'login_required',
+        'use --cookies',
+        'cookies-from-browser',
+    ]
+    return any(n in msg for n in needles)
+
+
+def _youtube_cookies_help_message(err=None) -> str:
+    has_cookies = bool(_COOKIES_CACHE_PATH and os.path.isfile(_COOKIES_CACHE_PATH)) or bool(
+        (os.getenv('YTDLP_COOKIES') or '').strip() or (os.getenv('YTDLP_COOKIES_BASE64') or '').strip()
+    )
+    if not has_cookies and COOKIES_FILE and os.path.isfile(COOKIES_FILE):
+        has_cookies = True
+    base = (
+        "❌ **無法播放 YouTube**\n"
+        "Railway 的伺服器 IP 被 YouTube 判定為機器人，必須提供登入 cookies。\n\n"
+        "**請這樣設定（一次即可）：**\n"
+        "1. 用 Chrome 擴充功能匯出 YouTube 的 Netscape `cookies.txt`\n"
+        "   （搜尋：`Get cookies.txt LOCALLY`）\n"
+        "2. 打開 Railway → 你的服務 → **Variables**\n"
+        "3. 新增變數 `YTDLP_COOKIES`，把 cookies.txt **全部內容貼上**\n"
+        "4. Redeploy 後再試\n\n"
+        "❌ **Cannot play YouTube**\n"
+        "This Railway IP is blocked by YouTube bot-check. Cookies are required.\n"
+        "Set `YTDLP_COOKIES` in Railway Variables to your Netscape cookies.txt contents, then redeploy."
+    )
+    if has_cookies:
+        base += "\n\n⚠️ 已偵測到 cookies，但仍被擋：cookies 可能過期，或需要住宅代理 `YTDLP_PROXY`。"
+    if err:
+        short = str(err)
+        if len(short) > 280:
+            short = short[:280] + '…'
+        base += f"\n\n技術細節 / detail: `{short}`"
+    return base
+
+
+def _format_stream_error(err) -> str:
+    # Prefer actionable cookies setup help for bot-check / missing-cookie failures
+    if _is_youtube_botcheck_error(err):
+        return _youtube_cookies_help_message(err)
+    text = str(err)
+    if 'YTDLP_COOKIES' in text or '無法播放 YouTube' in text:
+        return text if text.startswith('❌') else f"❌ {text}"
+    return f"❌ 取得串流失敗：{err}"
+
 # 設定語音連接日誌
 logging.basicConfig(level=logging.INFO)
 discord_logger = logging.getLogger('discord.voice_client')
@@ -406,22 +458,22 @@ class YTDLSource(discord.PCMVolumeTransformer):
     @classmethod
     def _extract_with_fallbacks(cls, url, *, stream=True):
         """
-        Try several YouTube player clients / format selectors.
-        Returns info dict or raises RuntimeError.
+        Try a small set of YouTube player clients / formats.
+        Fail fast on bot-check instead of retrying dozens of combinations.
         """
         ytdl_opts = cls._base_opts()
+        has_cookies = bool(ytdl_opts.get('cookiefile'))
+        if not has_cookies:
+            print("⚠️ 未設定 YouTube cookies：雲端 IP 很可能被 bot-check 擋下")
+
         client_variants = [
+            ['tv', 'web_embedded'],
             ['android', 'ios'],
-            ['android'],
-            ['ios'],
             ['mweb', 'web'],
-            ['web'],
         ]
         format_variants = [
             'bestaudio/best',
-            'bestaudio*',
             'best',
-            'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
         ]
 
         last_error = None
@@ -443,7 +495,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
                         if not entries:
                             continue
                         data = entries[0]
-                    # Reject image-only / empty stream results
                     stream_url = data.get('url')
                     formats = data.get('formats') or []
                     has_audio = bool(stream_url) or any(
@@ -455,7 +506,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
                         print(f"⚠️ 無音訊格式: clients={clients} format={fmt}")
                         continue
                     if not stream_url:
-                        # Pick a playable format URL for ffmpeg
                         for f in reversed(formats):
                             if f.get('url') and ((f.get('acodec') or 'none') != 'none' or f.get('vcodec') == 'none'):
                                 data['url'] = f['url']
@@ -469,13 +519,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
                 except Exception as e:
                     last_error = e
                     print(f"❌ 擷取失敗 clients={clients} format={fmt}: {e}")
+                    if _is_youtube_botcheck_error(e):
+                        # Don't burn time on 20 more identical bot-check failures
+                        raise RuntimeError(_youtube_cookies_help_message(e))
                     continue
 
-        hint = (
-            "YouTube 拒絕提供可播放格式。常見原因：缺少 cookies、雲端 IP 被標記、或 JS runtime 異常。"
-            "請在 Railway 設定 YTDLP_COOKIES / YTDLP_COOKIES_BASE64（Netscape cookies.txt）。"
-        )
-        raise RuntimeError(f"yt-dlp 無法擷取可播放音訊：{last_error}. {hint}")
+        if _is_youtube_botcheck_error(last_error) or not has_cookies:
+            raise RuntimeError(_youtube_cookies_help_message(last_error))
+        raise RuntimeError(f"yt-dlp 無法擷取可播放音訊：{last_error}")
 
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=False):
@@ -1392,6 +1443,170 @@ async def play_next_song(guild, voice_client, channel):
 
 
 @bot.event
+async def on_ready():
+    print(f'已登入為 {bot.user}')
+    print(f'Application ID: {APPLICATION_ID}')
+    
+    # Soft cleanup only: drop dead voice clients. Avoid force-churn on every ready.
+    print('🔄 檢查語音連接狀態...')
+    for vc in list(bot.voice_clients):
+        try:
+            if not vc.is_connected():
+                await vc.disconnect(force=True)
+                print(f'  - 已清理失效連接: {vc.guild.name}')
+        except Exception as e:
+            print(f'  - 清理失敗: {e}')
+    print('✅ 語音狀態檢查完成')
+    
+    # 檢查伺服器限制
+    if ALLOWED_SERVER_ID:
+        allowed_guild = bot.get_guild(int(ALLOWED_SERVER_ID))
+        if allowed_guild:
+            print(f'✅ 已連接到指定伺服器: {allowed_guild.name} (ID: {ALLOWED_SERVER_ID})')
+        else:
+            print(f'❌ 警告：找不到指定的伺服器 ID: {ALLOWED_SERVER_ID}')
+    else:
+        print('⚠️ 警告：未設定 ALLOWED_SERVER_ID，機器人將在所有伺服器運行')
+    
+    # 檢查頻道限制
+    if ALLOWED_CHANNEL_ID:
+        allowed_channel = bot.get_channel(int(ALLOWED_CHANNEL_ID))
+        if allowed_channel:
+            print(f'✅ 已找到指定頻道: #{allowed_channel.name} 在 {allowed_channel.guild.name}')
+        else:
+            print(f'❌ 警告：找不到指定的頻道 ID: {ALLOWED_CHANNEL_ID}')
+    
+    await update_log_channel_cache()
+
+    # YouTube cookies are required on Railway / datacenter IPs
+    cookies_path = _resolve_cookies_file()
+    if cookies_path:
+        print(f'🍪 YouTube cookies: 已載入 ({cookies_path})')
+    else:
+        print('🚨 YouTube cookies: 未設定！搜尋可能成功，但播放會被 bot-check 擋下。')
+        print('   請在 Railway Variables 設定 YTDLP_COOKIES（Netscape cookies.txt 全文）後 Redeploy。')
+
+    print('🤖 機器人已準備就緒！')
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    # 若 bot 自己被強制踢出語音，不嘗試自動重連
+    try:
+        if member and member.id == bot.user.id:
+            # 由有語音 -> 無語音：代表被斷線
+            if before and before.channel and (not after or not after.channel):
+                guild = member.guild
+                # 阻止任何後續自動重連並強制關閉語音
+                try:
+                    vc = discord.utils.get(bot.voice_clients, guild=guild)
+                    if vc:
+                        try:
+                            vc.reconnect = False
+                        except Exception:
+                            pass
+                        try:
+                            await vc.disconnect(force=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # 判斷斷線原因
+                reason = disconnect_reasons.pop(guild.id, None)
+                # 清理該 guild 的播放器狀態，不自動重連
+                ad_filter_players.pop(guild.id, None)
+                # 清空播放佇列與循環狀態
+                try:
+                    song_queues[guild.id] = []
+                except Exception:
+                    pass
+                loop_states.pop(guild.id, None)
+                # 根據原因記錄不同訊息，並嘗試同步到最後的音樂頻道
+                music_channel = last_music_channels.get(guild.id)
+                if reason == 'finished':
+                    msg = "✅ 播放清單已播放完畢，已自動離線並清空佇列。"
+                    await log_action(guild, msg)
+                    try:
+                        if music_channel:
+                            await music_channel.send(msg)
+                    except Exception:
+                        pass
+                elif reason == 'user_dc':
+                    msg = "👋 使用者要求離線，已離開語音並清空佇列。"
+                    await log_action(guild, msg)
+                    try:
+                        if music_channel:
+                            await music_channel.send(msg)
+                    except Exception:
+                        pass
+                elif reason == 'connection_failed':
+                    # 連接失敗，不顯示訊息（避免誤報）
+                    print(f"⚠️ 連接失敗（4006 錯誤），不顯示訊息給用戶")
+                    pass
+                else:
+                    # 只有在沒有連接失敗標記時才顯示"被強制斷開"
+                    if guild.id not in connection_failures:
+                        msg = "⚠️ Bot 被強制斷開語音，已停用重連並清空播放佇列。"
+                        await log_action(guild, msg)
+                        try:
+                            if music_channel:
+                                await music_channel.send(msg)
+                        except Exception:
+                            pass
+                    else:
+                        # 清除連接失敗標記
+                        connection_failures.pop(guild.id, None)
+                        print(f"⚠️ 連接失敗，已清除標記")
+    except Exception:
+        pass
+
+@bot.event
+async def on_guild_join(guild):
+    await update_log_channel_cache()
+
+@bot.event
+async def on_guild_remove(guild):
+    if guild.id in log_channel_cache:
+        del log_channel_cache[guild.id]
+    if guild.id in song_queues:
+        del song_queues[guild.id]
+    if guild.id in ad_filter_players:
+        del ad_filter_players[guild.id]
+    if guild.id in loop_states:
+        del loop_states[guild.id]
+    if guild.id in edit_permissions:
+        del edit_permissions[guild.id]
+    if guild.id in permission_cooldowns:
+        del permission_cooldowns[guild.id]
+    if guild.id in high_permission_cooldowns:
+        del high_permission_cooldowns[guild.id]
+
+async def get_log_channel(guild):
+    # 若指定了固定日誌頻道，直接回傳該頻道
+    try:
+        if LOG_IT_CHANNEL_ID:
+            channel = bot.get_channel(int(LOG_IT_CHANNEL_ID))
+            if channel and channel.guild.id == guild.id:
+                return channel
+    except Exception:
+        pass
+    # 退回快取邏輯
+    return log_channel_cache.get(guild.id)
+
+async def update_log_channel_cache():
+    # 檢查所有伺服器的 log-it 頻道
+    for guild in bot.guilds:
+        channel = discord.utils.get(guild.text_channels, name="log-it")
+        if channel:
+            log_channel_cache[guild.id] = channel
+        else:
+            log_channel_cache[guild.id] = None
+
+async def log_action(guild, msg):
+    channel = await get_log_channel(guild)
+    if channel:
+        await channel.send(msg)
+
+@bot.event
 async def on_message(message):
     if message.author.bot:
         return
@@ -1655,7 +1870,7 @@ async def on_message(message):
                         player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
                         title = player.title or entry.get('title') or 'Unknown Title'
                     except Exception as e:
-                        await prompt.edit(content=f"❌ 取得串流失敗：{e}", view=None)
+                        await prompt.edit(content=_format_stream_error(e), view=None)
                         return
                     song_info = {
                         'title': title,
@@ -1799,7 +2014,7 @@ async def on_message(message):
                         player = await YTDLSource.from_url(url, loop=bot.loop, stream=True)
                         title = player.title or entry.get('title') or 'Unknown Title'
                     except Exception as e:
-                        await prompt.edit(content=f"❌ 取得串流失敗：{e}", view=None)
+                        await prompt.edit(content=_format_stream_error(e), view=None)
                         return
                     song_info = {
                         'title': title,
