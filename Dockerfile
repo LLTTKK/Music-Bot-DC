@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     ffmpeg \
     libopus0 \
+    libffi8 \
  && rm -rf /var/lib/apt/lists/* \
  && apt-get clean
 
