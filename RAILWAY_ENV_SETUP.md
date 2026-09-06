@@ -34,13 +34,23 @@ LOG_IT_CHANNEL_ID=your_log_channel_id_here
 HARD_ADMIN_USER_IDS=123456789012345678,987654321098765432
 ```
 
-#### yt-dlp 進階設定（可選）
+#### yt-dlp / YouTube 播放設定（建議）
 ```
+# 推薦：把 Netscape cookies.txt 內容貼到變數（Railway 無本機檔案時必備）
+YTDLP_COOKIES=
+# 或使用 base64
+YTDLP_COOKIES_BASE64=
+# 或容器內檔案路徑
 YTDLP_COOKIES_FILE=cookies.txt
 YTDLP_PROXY=
 YTDLP_YT_ANDROID_PO_TOKEN=
 YTDLP_YT_IOS_PO_TOKEN=
 ```
+
+若出現 `Requested format is not available` / `Only images are available` / `Sign in to confirm you’re not a bot`：
+1. 確認部署映像已含 Node.js（本 repo Dockerfile 已安裝）
+2. 匯出瀏覽器 YouTube cookies（Netscape 格式）並設定 `YTDLP_COOKIES`
+3. 必要時再加住宅型 `YTDLP_PROXY`
 
 ## 📋 如何獲取 Discord 資訊
 
