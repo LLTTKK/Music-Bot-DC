@@ -66,8 +66,11 @@ def validate_environment():
     print("✅ 所有必要的環境變數都已設定")
     return True
 
-# yt-dlp 進階設定：cookies 與 proxy（可用 Railway/環境變數設定）
-COOKIES_FILE = os.getenv('YTDLP_COOKIES_FILE', 'cookies.txt')  # Netscape 格式 cookies（自動偵測）
+# yt-dlp 進階設定：cookies / proxy / PO token（可用 Railway 環境變數設定）
+COOKIES_FILE = os.getenv('YTDLP_COOKIES_FILE', 'cookies.txt')  # Netscape 格式 cookies 路徑
+# 也可直接把 Netscape cookies 內容放到環境變數（適合 Railway）：
+# YTDLP_COOKIES = 完整 cookies.txt 文字
+# 或 YTDLP_COOKIES_BASE64 = base64 編碼後的 cookies.txt
 PROXY_URL = os.getenv('YTDLP_PROXY')  # 例如：http://user:pass@host:port 或 socks5://host:port
 ANDROID_PO_TOKEN = os.getenv('YTDLP_YT_ANDROID_PO_TOKEN')
 IOS_PO_TOKEN = os.getenv('YTDLP_YT_IOS_PO_TOKEN')
@@ -75,23 +78,69 @@ IOS_PO_TOKEN = os.getenv('YTDLP_YT_IOS_PO_TOKEN')
 # Spotify 支援（無需 API）
 SPOTIFY_ENABLED = True
 
+_COOKIES_CACHE_PATH = None
+
 def _resolve_cookies_file():
+    """
+    Resolve a Netscape cookies file for yt-dlp.
+    Priority:
+      1) YTDLP_COOKIES / YTDLP_COOKIES_BASE64 env content (written to /tmp)
+      2) YTDLP_COOKIES_FILE path on disk
+    """
+    global _COOKIES_CACHE_PATH
     try:
+        if _COOKIES_CACHE_PATH and os.path.isfile(_COOKIES_CACHE_PATH):
+            return _COOKIES_CACHE_PATH
+
+        raw = os.getenv('YTDLP_COOKIES')
+        b64 = os.getenv('YTDLP_COOKIES_BASE64')
+        content = None
+        if raw and raw.strip():
+            content = raw
+        elif b64 and b64.strip():
+            import base64
+            content = base64.b64decode(b64).decode('utf-8', errors='replace')
+
+        if content:
+            if 'youtube.com' not in content and 'google.com' not in content:
+                print("⚠️ 環境變數 cookies 內容看起來不含 YouTube/Google cookies")
+            out = '/tmp/yt_cookies.txt'
+            with open(out, 'w', encoding='utf-8') as f:
+                f.write(content)
+            _COOKIES_CACHE_PATH = out
+            print(f"✅ 已從環境變數寫入 cookies: {out}")
+            return out
+
         print(f"🔍 檢查 cookies 檔案: {COOKIES_FILE}")
         if COOKIES_FILE and os.path.isfile(COOKIES_FILE):
-            # 檢查檔案是否包含 YouTube 相關 cookies
             with open(COOKIES_FILE, 'r', encoding='utf-8') as f:
-                content = f.read()
-                if 'youtube.com' in content or 'google.com' in content:
-                    print(f"✅ cookies 檔案存在且包含 YouTube cookies: {COOKIES_FILE}")
-                    return COOKIES_FILE
-                else:
-                    print(f"⚠️ cookies 檔案存在但無 YouTube cookies: {COOKIES_FILE}")
+                file_content = f.read()
+            if 'youtube.com' in file_content or 'google.com' in file_content:
+                print(f"✅ cookies 檔案存在且包含 YouTube cookies: {COOKIES_FILE}")
+                _COOKIES_CACHE_PATH = COOKIES_FILE
+                return COOKIES_FILE
+            print(f"⚠️ cookies 檔案存在但無 YouTube cookies: {COOKIES_FILE}")
         else:
             print(f"❌ cookies 檔案不存在: {COOKIES_FILE}")
+            print("💡 可在 Railway 設定 YTDLP_COOKIES 或 YTDLP_COOKIES_BASE64 來提供 cookies")
     except Exception as e:
         print(f"❌ cookies 檔案檢查錯誤: {e}")
     return None
+
+
+def _build_youtube_extractor_args(player_clients):
+    """Build youtube extractor_args including optional PO tokens."""
+    youtube_args = {
+        'player_client': list(player_clients),
+    }
+    po_tokens = []
+    if ANDROID_PO_TOKEN:
+        po_tokens.append(f'android.gvs+{ANDROID_PO_TOKEN}')
+    if IOS_PO_TOKEN:
+        po_tokens.append(f'ios.gvs+{IOS_PO_TOKEN}')
+    if po_tokens:
+        youtube_args['po_token'] = po_tokens
+    return {'youtube': youtube_args}
 
 # 設定語音連接日誌
 logging.basicConfig(level=logging.INFO)
@@ -311,30 +360,27 @@ class AdFilterPlayer:
 
 # 取得音訊來源
 class YTDLSource(discord.PCMVolumeTransformer):
+    # Modern YouTube needs a JS runtime (Node in Docker) + flexible format fallback.
+    # Prefer audio, but accept progressive best if audio-only is blocked.
     YTDL_OPTIONS = {
-        # 優先 HLS（m3u8），再退回其他音訊
-        'format': 'bestaudio[protocol^=m3u8]/bestaudio/best',
+        'format': 'bestaudio/best',
         'noplaylist': True,
         'quiet': False,
         'no_warnings': False,
-        'extract_flat': 'in_playlist',
         'default_search': 'auto',
         'source_address': '0.0.0.0',
-        'ignoreerrors': True,
+        'ignoreerrors': False,
         'skip_download': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
-        # cookies 與 proxy 將於初始化時注入
-        'extractor_args': {
-            'youtube': {
-                'skip': [],
-                # 僅使用 web 系列 client，避免登入/PO Token 要求
-                'player_client': ['web'],
-                'player_skip': [],
-            }
-        }
+        'nocheckcertificate': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        },
+        # Node is installed in the Docker image for yt-dlp EJS challenges
+        'js_runtimes': {'node': {}},
+        'extractor_args': _build_youtube_extractor_args(['android', 'ios', 'mweb', 'web']),
     }
     FFMPEG_OPTIONS = {
-        # 增加連線與重試參數與超時
         'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 15000000',
         'options': '-vn'
     }
@@ -346,11 +392,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.url = data.get('url')
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False):
-        loop = loop or asyncio.get_event_loop()
-        # 動態注入 cookies 與 proxy
+    def _base_opts(cls):
         ytdl_opts = dict(cls.YTDL_OPTIONS)
-        # 注入 cookies 與 proxy
         cookie_file = _resolve_cookies_file()
         if cookie_file:
             ytdl_opts['cookiefile'] = cookie_file
@@ -358,59 +401,111 @@ class YTDLSource(discord.PCMVolumeTransformer):
         if PROXY_URL:
             ytdl_opts['proxy'] = PROXY_URL
             print(f"🌐 使用代理: {PROXY_URL}")
-        ytdl = yt_dlp.YoutubeDL(ytdl_opts)
-        def extract():
-            try:
-                # 僅 web 家族：web -> web_creator -> embedded
-                client_variants = [
-                    {'youtube': {'player_client': ['web']}},
-                    {'youtube': {'player_client': ['web_creator']}},
-                    {'youtube': {'player_client': ['embedded']}},
-                    {'youtube': {'player_client': ['ios']}},
-                    {'youtube': {'player_client': ['android']}},
-                ]
+        return ytdl_opts
 
-                for variant in client_variants:
-                    opts = {**ytdl_opts, 'extractor_args': variant}
-                    _ytdl = yt_dlp.YoutubeDL(opts)
-                    try:
-                        return _ytdl.extract_info(url, download=not stream)
-                    except Exception as e2:
-                        print(f"❌ 擷取失敗（variant={variant}）：{e2}")
+    @classmethod
+    def _extract_with_fallbacks(cls, url, *, stream=True):
+        """
+        Try several YouTube player clients / format selectors.
+        Returns info dict or raises RuntimeError.
+        """
+        ytdl_opts = cls._base_opts()
+        client_variants = [
+            ['android', 'ios'],
+            ['android'],
+            ['ios'],
+            ['mweb', 'web'],
+            ['web'],
+        ]
+        format_variants = [
+            'bestaudio/best',
+            'bestaudio*',
+            'best',
+            'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
+        ]
+
+        last_error = None
+        for clients in client_variants:
+            for fmt in format_variants:
+                opts = {
+                    **ytdl_opts,
+                    'format': fmt,
+                    'extractor_args': _build_youtube_extractor_args(clients),
+                }
+                try:
+                    print(f"🎬 yt-dlp extract clients={clients} format={fmt}")
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        data = ydl.extract_info(url, download=not stream)
+                    if not data:
                         continue
-                return None
-            except Exception as e:
-                print(f"❌ yt-dlp 擷取失敗: {e}")
-                return None
-        data = await loop.run_in_executor(None, extract)
-        if not data:
-            raise RuntimeError("yt-dlp 無法擷取此連結，請稍後再試或更換影片。")
-        if 'entries' in data:
-            data = data['entries'][0]
-        filename = data.get('url') if stream else ytdl.prepare_filename(data)
-        if not filename:
+                    if 'entries' in data:
+                        entries = [e for e in (data.get('entries') or []) if e]
+                        if not entries:
+                            continue
+                        data = entries[0]
+                    # Reject image-only / empty stream results
+                    stream_url = data.get('url')
+                    formats = data.get('formats') or []
+                    has_audio = bool(stream_url) or any(
+                        (f.get('acodec') and f.get('acodec') != 'none') or f.get('url') or f.get('manifest_url')
+                        for f in formats
+                    )
+                    if not has_audio:
+                        last_error = RuntimeError('Only non-audio formats were returned (bot-check / missing JS runtime)')
+                        print(f"⚠️ 無音訊格式: clients={clients} format={fmt}")
+                        continue
+                    if not stream_url:
+                        # Pick a playable format URL for ffmpeg
+                        for f in reversed(formats):
+                            if f.get('url') and ((f.get('acodec') or 'none') != 'none' or f.get('vcodec') == 'none'):
+                                data['url'] = f['url']
+                                stream_url = f['url']
+                                break
+                    if stream and not data.get('url'):
+                        last_error = RuntimeError('No stream URL in extracted info')
+                        continue
+                    print(f"✅ yt-dlp 成功: {data.get('title')} (clients={clients})")
+                    return data
+                except Exception as e:
+                    last_error = e
+                    print(f"❌ 擷取失敗 clients={clients} format={fmt}: {e}")
+                    continue
+
+        hint = (
+            "YouTube 拒絕提供可播放格式。常見原因：缺少 cookies、雲端 IP 被標記、或 JS runtime 異常。"
+            "請在 Railway 設定 YTDLP_COOKIES / YTDLP_COOKIES_BASE64（Netscape cookies.txt）。"
+        )
+        raise RuntimeError(f"yt-dlp 無法擷取可播放音訊：{last_error}. {hint}")
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: cls._extract_with_fallbacks(url, stream=stream))
+        filename = data.get('url') if stream else None
+        if stream and not filename:
             raise RuntimeError("找不到可播放的串流網址。")
+        if not stream:
+            # Rare non-stream path: let YoutubeDL prepare filename using last opts
+            ytdl = yt_dlp.YoutubeDL(cls._base_opts())
+            filename = ytdl.prepare_filename(data)
         return cls(discord.FFmpegPCMAudio(filename, **cls.FFMPEG_OPTIONS), data=data)
 
     @classmethod
     async def search_youtube(cls, query, *, loop=None, max_results=5):
         loop = loop or asyncio.get_event_loop()
-        
-        # 直接使用 ytsearch 格式
         search_query = f"ytsearch{max_results}:{query}"
-        
-        # 搜尋配置（含 cookies / proxy 支援）
         search_opts = {
             'extract_flat': True,
             'quiet': False,
             'ignoreerrors': True,
             'no_warnings': False,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'js_runtimes': {'node': {}},
             'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
                 'Accept-Language': 'en-US,en;q=0.9',
-            }
+            },
+            'extractor_args': _build_youtube_extractor_args(['web', 'mweb']),
         }
-        # 搜尋同樣支援 cookies 與 proxy
         cookie_file = _resolve_cookies_file()
         if cookie_file:
             search_opts['cookiefile'] = cookie_file
@@ -418,249 +513,37 @@ class YTDLSource(discord.PCMVolumeTransformer):
         if PROXY_URL:
             search_opts['proxy'] = PROXY_URL
             print(f"🌐(search) 使用代理: {PROXY_URL}")
-        
+
         try:
             print(f"🔍 搜尋: '{query}' -> '{search_query}'")
             ytdl = yt_dlp.YoutubeDL(search_opts)
-            
+
             def extract_search():
                 try:
                     return ytdl.extract_info(search_query, download=False)
                 except Exception as e:
                     print(f"❌ yt-dlp 錯誤: {e}")
                     return None
-            
+
             data = await loop.run_in_executor(None, extract_search)
-            
             print(f"📊 搜尋結果: {type(data)}")
             if isinstance(data, dict):
                 print(f"📊 結果鍵值: {list(data.keys())}")
-                
                 if 'entries' in data and data['entries']:
                     valid_entries = []
                     for entry in data['entries']:
                         if entry and entry.get('id') and entry.get('title'):
                             valid_entries.append(entry)
-                    
                     print(f"✅ 有效結果: {len(valid_entries)}")
                     for i, entry in enumerate(valid_entries[:3]):
                         print(f"  {i+1}. {entry.get('title', 'No title')}")
-                    
                     return valid_entries[:max_results]
-            
             print("❌ 搜尋無結果")
             return []
-            
         except Exception as e:
             print(f"❌ 搜尋異常: {e}")
             return []
 
-async def get_log_channel(guild):
-    # 若指定了固定日誌頻道，直接回傳該頻道
-    try:
-        if LOG_IT_CHANNEL_ID:
-            channel = bot.get_channel(int(LOG_IT_CHANNEL_ID))
-            if channel and channel.guild.id == guild.id:
-                return channel
-    except Exception:
-        pass
-    # 退回快取邏輯
-    return log_channel_cache.get(guild.id)
-
-async def update_log_channel_cache():
-    # 檢查所有伺服器的 log-it 頻道
-    for guild in bot.guilds:
-        channel = discord.utils.get(guild.text_channels, name="log-it")
-        if channel:
-            log_channel_cache[guild.id] = channel
-        else:
-            log_channel_cache[guild.id] = None
-
-@bot.event
-async def on_ready():
-    print(f'已登入為 {bot.user}')
-    print(f'Application ID: {APPLICATION_ID}')
-    
-    # Soft cleanup only: drop dead voice clients. Avoid force-churn on every ready.
-    print('🔄 檢查語音連接狀態...')
-    for vc in list(bot.voice_clients):
-        try:
-            if not vc.is_connected():
-                await vc.disconnect(force=True)
-                print(f'  - 已清理失效連接: {vc.guild.name}')
-        except Exception as e:
-            print(f'  - 清理失敗: {e}')
-    print('✅ 語音狀態檢查完成')
-    
-    # 檢查伺服器限制
-    if ALLOWED_SERVER_ID:
-        allowed_guild = bot.get_guild(int(ALLOWED_SERVER_ID))
-        if allowed_guild:
-            print(f'✅ 已連接到指定伺服器: {allowed_guild.name} (ID: {ALLOWED_SERVER_ID})')
-        else:
-            print(f'❌ 警告：找不到指定的伺服器 ID: {ALLOWED_SERVER_ID}')
-    else:
-        print('⚠️ 警告：未設定 ALLOWED_SERVER_ID，機器人將在所有伺服器運行')
-    
-    # 檢查頻道限制
-    if ALLOWED_CHANNEL_ID:
-        allowed_channel = bot.get_channel(int(ALLOWED_CHANNEL_ID))
-        if allowed_channel:
-            print(f'✅ 已找到指定頻道: #{allowed_channel.name} 在 {allowed_channel.guild.name}')
-        else:
-            print(f'❌ 警告：找不到指定的頻道 ID: {ALLOWED_CHANNEL_ID}')
-    
-    await update_log_channel_cache()
-    print('🤖 機器人已準備就緒！')
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    # 若 bot 自己被強制踢出語音，不嘗試自動重連
-    try:
-        if member and member.id == bot.user.id:
-            # 由有語音 -> 無語音：代表被斷線
-            if before and before.channel and (not after or not after.channel):
-                guild = member.guild
-                # 阻止任何後續自動重連並強制關閉語音
-                try:
-                    vc = discord.utils.get(bot.voice_clients, guild=guild)
-                    if vc:
-                        try:
-                            vc.reconnect = False
-                        except Exception:
-                            pass
-                        try:
-                            await vc.disconnect(force=True)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                # 判斷斷線原因
-                reason = disconnect_reasons.pop(guild.id, None)
-                # 清理該 guild 的播放器狀態，不自動重連
-                ad_filter_players.pop(guild.id, None)
-                # 清空播放佇列與循環狀態
-                try:
-                    song_queues[guild.id] = []
-                except Exception:
-                    pass
-                loop_states.pop(guild.id, None)
-                # 根據原因記錄不同訊息，並嘗試同步到最後的音樂頻道
-                music_channel = last_music_channels.get(guild.id)
-                if reason == 'finished':
-                    msg = "✅ 播放清單已播放完畢，已自動離線並清空佇列。"
-                    await log_action(guild, msg)
-                    try:
-                        if music_channel:
-                            await music_channel.send(msg)
-                    except Exception:
-                        pass
-                elif reason == 'user_dc':
-                    msg = "👋 使用者要求離線，已離開語音並清空佇列。"
-                    await log_action(guild, msg)
-                    try:
-                        if music_channel:
-                            await music_channel.send(msg)
-                    except Exception:
-                        pass
-                elif reason == 'connection_failed':
-                    # 連接失敗，不顯示訊息（避免誤報）
-                    print(f"⚠️ 連接失敗（4006 錯誤），不顯示訊息給用戶")
-                    pass
-                else:
-                    # 只有在沒有連接失敗標記時才顯示"被強制斷開"
-                    if guild.id not in connection_failures:
-                        msg = "⚠️ Bot 被強制斷開語音，已停用重連並清空播放佇列。"
-                        await log_action(guild, msg)
-                        try:
-                            if music_channel:
-                                await music_channel.send(msg)
-                        except Exception:
-                            pass
-                    else:
-                        # 清除連接失敗標記
-                        connection_failures.pop(guild.id, None)
-                        print(f"⚠️ 連接失敗，已清除標記")
-    except Exception:
-        pass
-
-@bot.event
-async def on_guild_join(guild):
-    await update_log_channel_cache()
-
-@bot.event
-async def on_guild_remove(guild):
-    if guild.id in log_channel_cache:
-        del log_channel_cache[guild.id]
-    if guild.id in song_queues:
-        del song_queues[guild.id]
-    if guild.id in ad_filter_players:
-        del ad_filter_players[guild.id]
-    if guild.id in loop_states:
-        del loop_states[guild.id]
-    if guild.id in edit_permissions:
-        del edit_permissions[guild.id]
-    if guild.id in permission_cooldowns:
-        del permission_cooldowns[guild.id]
-    if guild.id in high_permission_cooldowns:
-        del high_permission_cooldowns[guild.id]
-
-async def log_action(guild, msg):
-    channel = await get_log_channel(guild)
-    if channel:
-        await channel.send(msg)
-
-# SponsorBlock 廣告過濾整合
-import aiohttp
-import json
-
-
-def _sponsorblock_bounds(segment):
-    """Return (start, end) seconds from a SponsorBlock segment object."""
-    try:
-        raw = segment.get('segment') if isinstance(segment, dict) else None
-        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
-            return float(raw[0]), float(raw[1])
-        start = (segment or {}).get('start', (segment or {}).get('startTime', 0)) or 0
-        end = (segment or {}).get('end', (segment or {}).get('endTime', 0)) or 0
-        return float(start), float(end)
-    except Exception:
-        return 0.0, 0.0
-
-async def get_sponsorblock_segments(video_id):
-    """
-    從 SponsorBlock 獲取廣告時間段資訊
-    返回需要跳過的廣告時間段列表
-    """
-    try:
-        # SponsorBlock API 端點
-        # 精簡類別並加入 UA；400 時僅紀錄，不擾動播放
-        url = f"https://sponsor.ajay.app/api/skipSegments?videoID={video_id}&categories=sponsor,selfpromo,interaction"
-        headers = {"User-Agent": "Mozilla/5.0 (DiscordMusicBot)"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data
-                else:
-                    print(f"SponsorBlock API 錯誤: {response.status}")
-                    return []
-    except Exception as e:
-        print(f"SponsorBlock 請求失敗: {e}")
-        return []
-
-def extract_video_id(url):
-    """
-    從 YouTube URL 提取影片 ID
-    """
-    try:
-        if 'youtube.com/watch?v=' in url:
-            return url.split('watch?v=')[1].split('&')[0]
-        elif 'youtu.be/' in url:
-            return url.split('youtu.be/')[1].split('?')[0]
-        return None
-    except:
-        return None
 
 # Spotify 支援函數（無需 API）
 def parse_spotify_url(url):
