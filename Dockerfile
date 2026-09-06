@@ -1,15 +1,15 @@
-# syntax=docker/dockerfile:1.4
 FROM python:3.11-slim
 
-# 優化環境變數
+# Optimize Python / pip behavior for container builds
 ENV PYTHONUNBUFFERED=1 \
     PIP_DEFAULT_TIMEOUT=60 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# 系統相依套件（音訊播放所需）
+# System deps for Discord voice playback
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     ffmpeg \
     libopus0 \
  && rm -rf /var/lib/apt/lists/* \
@@ -17,19 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# 關鍵：先複製 requirements.txt
+# Install Python deps first for better Docker layer caching
 COPY requirements.txt ./
-
-# 安裝依賴 - 這層只有在 requirements.txt 改變時才會重建
 RUN pip install -r requirements.txt
 
-# 複製應用程式代碼 - 這層在代碼改變時會重建，但不會重新安裝套件
+# Application source
 COPY . .
 
-# 健康檢查 (可選)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import discord; print('OK')" || exit 1
-
 CMD ["python", "bot.py"]
-
-
