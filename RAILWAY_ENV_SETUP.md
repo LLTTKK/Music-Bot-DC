@@ -36,21 +36,25 @@ HARD_ADMIN_USER_IDS=123456789012345678,987654321098765432
 
 #### yt-dlp / YouTube 播放設定（建議）
 ```
-# 推薦：把 Netscape cookies.txt 內容貼到變數（Railway 無本機檔案時必備）
-YTDLP_COOKIES=
-# 或使用 base64
-YTDLP_COOKIES_BASE64=
-# 或容器內檔案路徑
-YTDLP_COOKIES_FILE=cookies.txt
+# 預設不必 cookies：被 YouTube 擋時自動走 Piped/Invidious
+YT_FRONTEND_FALLBACK=1
+PIPED_INSTANCES=https://api.piped.private.coffee
+INVIDIOUS_INSTANCES=
+# 可選：住宅代理（比 cookies 更不需動到 Google 帳號）
 YTDLP_PROXY=
+# 可選加強
+YTDLP_COOKIES=
+YTDLP_COOKIES_BASE64=
+YTDLP_COOKIES_FILE=cookies.txt
 YTDLP_YT_ANDROID_PO_TOKEN=
 YTDLP_YT_IOS_PO_TOKEN=
 ```
 
 若出現 `Requested format is not available` / `Only images are available` / `Sign in to confirm you’re not a bot`：
-1. 確認部署映像已含 Node.js（本 repo Dockerfile 已安裝）
-2. 匯出瀏覽器 YouTube cookies（Netscape 格式）並設定 `YTDLP_COOKIES`
-3. 必要時再加住宅型 `YTDLP_PROXY`
+1. **不必匯出 cookies**。部署後機器人會自動改走 Piped（可用 `PIPED_INSTANCES` / `INVIDIOUS_INSTANCES` 自訂實例）
+2. 確認部署映像已含 Node.js（本 repo Dockerfile 已安裝）
+3. 若公開前端實例也不穩，改設住宅型 `YTDLP_PROXY`
+4. cookies（`YTDLP_COOKIES`）只是可選加強，不是必要步驟
 
 ## 📋 如何獲取 Discord 資訊
 

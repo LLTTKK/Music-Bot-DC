@@ -10,6 +10,7 @@ import yt_dlp
 # pip install spotipy
 
 import os
+import json
 import psutil
 import time
 import datetime
@@ -75,6 +76,20 @@ PROXY_URL = os.getenv('YTDLP_PROXY')  # 例如：http://user:pass@host:port 或 
 ANDROID_PO_TOKEN = os.getenv('YTDLP_YT_ANDROID_PO_TOKEN')
 IOS_PO_TOKEN = os.getenv('YTDLP_YT_IOS_PO_TOKEN')
 
+# Cookies-free YouTube playback via public frontends (Piped / Invidious).
+# Railway datacenter IPs are often bot-checked by YouTube itself; these
+# instances fetch/proxy streams from a different IP.
+_FRONTEND_FALLBACK_ENABLED = os.getenv('YT_FRONTEND_FALLBACK', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+_DEFAULT_PIPED_INSTANCES = (
+    'https://api.piped.private.coffee',
+)
+_DEFAULT_INVIDIOUS_INSTANCES = ()
+_YT_ID_RE = re.compile(
+    r'(?:youtube\.com/(?:watch\?(?:.*&)?v=|embed/|shorts/|live/)|youtu\.be/)([0-9A-Za-z_-]{11})',
+    re.IGNORECASE,
+)
+_HTTP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'
+
 # Spotify 支援（無需 API）
 SPOTIFY_ENABLED = True
 
@@ -121,8 +136,7 @@ def _resolve_cookies_file():
                 return COOKIES_FILE
             print(f"⚠️ cookies 檔案存在但無 YouTube cookies: {COOKIES_FILE}")
         else:
-            print(f"❌ cookies 檔案不存在: {COOKIES_FILE}")
-            print("💡 可在 Railway 設定 YTDLP_COOKIES 或 YTDLP_COOKIES_BASE64 來提供 cookies")
+            print(f"ℹ️ cookies 檔案不存在: {COOKIES_FILE}（可略過；將使用 Piped/Invidious 備援）")
     except Exception as e:
         print(f"❌ cookies 檔案檢查錯誤: {e}")
     return None
@@ -156,27 +170,169 @@ def _is_youtube_botcheck_error(err) -> bool:
     return any(n in msg for n in needles)
 
 
-def _youtube_cookies_help_message(err=None) -> str:
-    has_cookies = bool(_COOKIES_CACHE_PATH and os.path.isfile(_COOKIES_CACHE_PATH)) or bool(
-        (os.getenv('YTDLP_COOKIES') or '').strip() or (os.getenv('YTDLP_COOKIES_BASE64') or '').strip()
+def _split_instances(raw, defaults):
+    items = [x.strip().rstrip('/') for x in (raw or '').split(',') if x.strip()]
+    return items or list(defaults)
+
+
+def _piped_instances():
+    return _split_instances(os.getenv('PIPED_INSTANCES'), _DEFAULT_PIPED_INSTANCES)
+
+
+def _invidious_instances():
+    return _split_instances(os.getenv('INVIDIOUS_INSTANCES'), _DEFAULT_INVIDIOUS_INSTANCES)
+
+
+def _youtube_video_id(url):
+    if not url:
+        return None
+    text = str(url).strip()
+    m = _YT_ID_RE.search(text)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r'[0-9A-Za-z_-]{11}', text):
+        return text
+    return None
+
+
+def _http_json(url, timeout=12):
+    import urllib.request
+    req = urllib.request.Request(
+        url,
+        headers={'User-Agent': _HTTP_UA, 'Accept': 'application/json'},
     )
-    if not has_cookies and COOKIES_FILE and os.path.isfile(COOKIES_FILE):
-        has_cookies = True
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8', errors='replace'))
+
+
+def _pick_highest_bitrate(streams):
+    best = None
+    best_br = -1
+    for item in streams or []:
+        url = item.get('url')
+        if not url:
+            continue
+        try:
+            br = int(item.get('bitrate') or 0)
+        except (TypeError, ValueError):
+            br = 0
+        if br >= best_br:
+            best = item
+            best_br = br
+    return best
+
+
+def _extract_via_piped(video_id):
+    last_error = None
+    for base in _piped_instances():
+        api = f'{base}/streams/{video_id}'
+        try:
+            print(f'🔁 Piped 備援: {api}')
+            data = _http_json(api)
+            audio = [s for s in (data.get('audioStreams') or []) if s.get('url')]
+            muxed = [
+                s for s in (data.get('videoStreams') or [])
+                if s.get('url') and not s.get('videoOnly')
+            ]
+            chosen = _pick_highest_bitrate(audio) or _pick_highest_bitrate(muxed)
+            if not chosen:
+                last_error = RuntimeError(f'Piped {base} 沒有可播放音訊')
+                print(f'⚠️ {last_error}')
+                continue
+            title = data.get('title') or video_id
+            print(f'✅ Piped 成功: {title} via {base}')
+            return {
+                'id': video_id,
+                'title': title,
+                'url': chosen['url'],
+                'webpage_url': f'https://www.youtube.com/watch?v={video_id}',
+                'extractor': 'piped',
+                'acodec': chosen.get('codec') or 'unknown',
+            }
+        except Exception as e:
+            last_error = e
+            print(f'❌ Piped 失敗 {base}: {e}')
+    if last_error:
+        raise last_error
+    raise RuntimeError('沒有可用的 Piped 實例')
+
+
+def _extract_via_invidious(video_id):
+    last_error = None
+    for base in _invidious_instances():
+        api = f'{base}/api/v1/videos/{video_id}?local=true'
+        try:
+            print(f'🔁 Invidious 備援: {api}')
+            data = _http_json(api)
+            formats = list(data.get('adaptiveFormats') or []) + list(data.get('formatStreams') or [])
+            audio = []
+            muxed = []
+            for item in formats:
+                if not item.get('url'):
+                    continue
+                kind = str(item.get('type') or item.get('mimeType') or '').lower()
+                if 'audio' in kind:
+                    audio.append(item)
+                elif 'video' in kind:
+                    muxed.append(item)
+            chosen = _pick_highest_bitrate(audio) or _pick_highest_bitrate(muxed)
+            if not chosen:
+                last_error = RuntimeError(f'Invidious {base} 沒有可播放音訊')
+                print(f'⚠️ {last_error}')
+                continue
+            title = data.get('title') or video_id
+            print(f'✅ Invidious 成功: {title} via {base}')
+            return {
+                'id': video_id,
+                'title': title,
+                'url': chosen['url'],
+                'webpage_url': f'https://www.youtube.com/watch?v={video_id}',
+                'extractor': 'invidious',
+            }
+        except Exception as e:
+            last_error = e
+            print(f'❌ Invidious 失敗 {base}: {e}')
+    if last_error:
+        raise last_error
+    raise RuntimeError('沒有可用的 Invidious 實例')
+
+
+def _extract_via_frontends(url):
+    """Cookies-free YouTube extract via Piped, then Invidious."""
+    if not _FRONTEND_FALLBACK_ENABLED:
+        return None
+    video_id = _youtube_video_id(url)
+    if not video_id:
+        return None
+    errors = []
+    if _piped_instances():
+        try:
+            return _extract_via_piped(video_id)
+        except Exception as e:
+            errors.append(f'piped: {e}')
+    if _invidious_instances():
+        try:
+            return _extract_via_invidious(video_id)
+        except Exception as e:
+            errors.append(f'invidious: {e}')
+    if errors:
+        print('⚠️ 前端備援全部失敗: ' + ' | '.join(errors))
+    return None
+
+
+def _youtube_cookies_help_message(err=None) -> str:
     base = (
         "❌ **無法播放 YouTube**\n"
-        "Railway 的伺服器 IP 被 YouTube 判定為機器人，必須提供登入 cookies。\n\n"
-        "**請這樣設定（一次即可）：**\n"
-        "1. 用 Chrome 擴充功能匯出 YouTube 的 Netscape `cookies.txt`\n"
-        "   （搜尋：`Get cookies.txt LOCALLY`）\n"
-        "2. 打開 Railway → 你的服務 → **Variables**\n"
-        "3. 新增變數 `YTDLP_COOKIES`，把 cookies.txt **全部內容貼上**\n"
-        "4. Redeploy 後再試\n\n"
+        "Railway 的 IP 被 YouTube 擋下，且 Piped/Invidious 備援也失敗。\n"
+        "**不必匯出 cookies**，可改用下面任一方式：\n"
+        "1. 設定住宅代理 `YTDLP_PROXY`（例如 `http://user:pass@host:port`）後 Redeploy\n"
+        "2. 或改貼 SoundCloud 連結（通常不需 cookies）\n"
+        "3. 可選：在 Variables 自訂 `PIPED_INSTANCES` / `INVIDIOUS_INSTANCES`\n\n"
         "❌ **Cannot play YouTube**\n"
-        "This Railway IP is blocked by YouTube bot-check. Cookies are required.\n"
-        "Set `YTDLP_COOKIES` in Railway Variables to your Netscape cookies.txt contents, then redeploy."
+        "YouTube blocked this Railway IP, and the Piped/Invidious fallback also failed.\n"
+        "You do **not** need to export cookies. Set a residential `YTDLP_PROXY`, "
+        "use a SoundCloud link, or configure your own frontend instances."
     )
-    if has_cookies:
-        base += "\n\n⚠️ 已偵測到 cookies，但仍被擋：cookies 可能過期，或需要住宅代理 `YTDLP_PROXY`。"
     if err:
         short = str(err)
         if len(short) > 280:
@@ -433,7 +589,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
         'extractor_args': _build_youtube_extractor_args(['android', 'ios', 'mweb', 'web']),
     }
     FFMPEG_OPTIONS = {
-        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 15000000',
+        'before_options': (
+            '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 15000000 '
+            f'-user_agent "{_HTTP_UA}"'
+        ),
         'options': '-vn'
     }
 
@@ -463,8 +622,24 @@ class YTDLSource(discord.PCMVolumeTransformer):
         """
         ytdl_opts = cls._base_opts()
         has_cookies = bool(ytdl_opts.get('cookiefile'))
+        frontend_result = None
+        frontend_attempted = False
+
+        def try_frontends():
+            nonlocal frontend_result, frontend_attempted
+            if frontend_attempted:
+                return frontend_result
+            frontend_attempted = True
+            frontend_result = _extract_via_frontends(url)
+            return frontend_result
+
+        # Without cookies, YouTube itself usually bot-checks Railway IPs.
+        # Try Piped/Invidious first so playback works without exporting cookies.
         if not has_cookies:
-            print("⚠️ 未設定 YouTube cookies：雲端 IP 很可能被 bot-check 擋下")
+            print("ℹ️ 未設定 YouTube cookies，改走 Piped/Invidious 備援（不必匯出 cookies）")
+            data = try_frontends()
+            if data:
+                return data
 
         client_variants = [
             ['tv', 'web_embedded'],
@@ -520,10 +695,15 @@ class YTDLSource(discord.PCMVolumeTransformer):
                     last_error = e
                     print(f"❌ 擷取失敗 clients={clients} format={fmt}: {e}")
                     if _is_youtube_botcheck_error(e):
-                        # Don't burn time on 20 more identical bot-check failures
+                        data = try_frontends()
+                        if data:
+                            return data
                         raise RuntimeError(_youtube_cookies_help_message(e))
                     continue
 
+        data = try_frontends()
+        if data:
+            return data
         if _is_youtube_botcheck_error(last_error) or not has_cookies:
             raise RuntimeError(_youtube_cookies_help_message(last_error))
         raise RuntimeError(f"yt-dlp 無法擷取可播放音訊：{last_error}")
@@ -1478,13 +1658,16 @@ async def on_ready():
     
     await update_log_channel_cache()
 
-    # YouTube cookies are required on Railway / datacenter IPs
     cookies_path = _resolve_cookies_file()
     if cookies_path:
         print(f'🍪 YouTube cookies: 已載入 ({cookies_path})')
+    elif _FRONTEND_FALLBACK_ENABLED:
+        print('ℹ️ YouTube cookies 未設定。將優先使用 Piped/Invidious 備援，不必匯出 cookies。')
+        print(f'   Piped: {", ".join(_piped_instances()) or "(none)"}')
+        if _invidious_instances():
+            print(f'   Invidious: {", ".join(_invidious_instances())}')
     else:
-        print('🚨 YouTube cookies: 未設定！搜尋可能成功，但播放會被 bot-check 擋下。')
-        print('   請在 Railway Variables 設定 YTDLP_COOKIES（Netscape cookies.txt 全文）後 Redeploy。')
+        print('🚨 YouTube cookies 未設定，且 YT_FRONTEND_FALLBACK 已關閉。播放很可能被 bot-check 擋下。')
 
     print('🤖 機器人已準備就緒！')
 
