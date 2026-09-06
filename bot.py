@@ -60,7 +60,7 @@ def validate_environment():
         for var in missing_vars:
             print(f"   - {var}")
         print("\n請在 Railway 環境變數中設定這些變數。")
-        print("請參考 .env.example 檔案了解所需的環境變數。")
+        print("請參考 env.example 檔案了解所需的環境變數。")
         return False
     
     print("✅ 所有必要的環境變數都已設定")
