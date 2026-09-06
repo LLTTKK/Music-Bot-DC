@@ -105,7 +105,7 @@ intents.voice_states = True     # 語音頻道功能
 intents.guilds = True          # 伺服器資訊
 intents.guild_messages = True  # 伺服器訊息
 
-bot = commands.Bot(command_prefix=['[', '[? '], intents=intents)
+bot = commands.Bot(command_prefix=['[? ', '['], intents=intents)
 tree = bot.tree
 
 # 忽略 CommandNotFound 錯誤（因為我們使用自定義訊息處理）
@@ -146,6 +146,9 @@ edit_permissions = {}
 
 # 全域變數：權限冷卻時間管理（每個 guild 一個）
 permission_cooldowns = {}
+
+# Per-guild lock to prevent concurrent voice connect attempts (causes 4006)
+_voice_connect_locks = {}
 
 # 廣告過濾播放器類別
 class AdFilterPlayer:
@@ -470,22 +473,16 @@ async def on_ready():
     print(f'已登入為 {bot.user}')
     print(f'Application ID: {APPLICATION_ID}')
     
-    # 清理任何現有的語音連接（防止 4006 錯誤）
-    print('🔄 清理現有語音連接...')
-    for vc in bot.voice_clients:
+    # Soft cleanup only: drop dead voice clients. Avoid force-churn on every ready.
+    print('🔄 檢查語音連接狀態...')
+    for vc in list(bot.voice_clients):
         try:
-            await vc.disconnect(force=True)
-            print(f'  - 已斷開 {vc.guild.name} 的語音連接')
+            if not vc.is_connected():
+                await vc.disconnect(force=True)
+                print(f'  - 已清理失效連接: {vc.guild.name}')
         except Exception as e:
             print(f'  - 清理失敗: {e}')
-    
-    # 清空播放佇列和狀態
-    song_queues.clear()
-    loop_states.clear()
-    ad_filter_players.clear()
-    disconnect_reasons.clear()
-    last_music_channels.clear()
-    print('✅ 語音連接和播放狀態已清理')
+    print('✅ 語音狀態檢查完成')
     
     # 檢查伺服器限制
     if ALLOWED_SERVER_ID:
@@ -1221,215 +1218,114 @@ def stop_current_playback(guild_id):
 
 async def connect_to_voice_channel(guild, voice_channel, channel):
     """
-    統一的語音頻道連接函數，使用改進的連接方法
-    特別處理 WebSocket 4006 錯誤（Session no longer valid）
+    Connect to a voice channel reliably.
+
+    Close code 4006 (session no longer valid) is primarily fixed by upgrading
+    to discord.py 2.7.x voice handshake. This helper adds a per-guild lock and
+    light cleanup so concurrent joins cannot race the same session.
     """
-    max_retries = 3
-    retry_count = 0
-    
-    # 首先檢查是否已經有連接
-    voice_client = guild.voice_client
-    if voice_client:
-        if voice_client.is_connected():
-            if voice_client.channel == voice_channel:
+    lock = _voice_connect_locks.setdefault(guild.id, asyncio.Lock())
+
+    async with lock:
+        existing = guild.voice_client
+        if existing and existing.is_connected():
+            if existing.channel == voice_channel:
                 print(f"✅ 已在語音頻道: {voice_channel.name}")
-                return voice_client
-            else:
-                # 在不同頻道，嘗試移動
-                try:
-                    print(f"🔄 移動到語音頻道: {voice_channel.name}")
-                    await voice_client.move_to(voice_channel)
-                    await asyncio.sleep(1)  # 等待移動完成
-                    if voice_client.is_connected() and voice_client.channel == voice_channel:
-                        return voice_client
-                except Exception as e:
-                    print(f"⚠️ 移動失敗: {e}")
-                    # 移動失敗，斷開重連
-                    try:
-                        await voice_client.disconnect(force=True)
-                    except Exception:
-                        pass
-                    await asyncio.sleep(3)
-        else:
-            # 連接對象存在但未連接，清理
+                return existing
             try:
-                await voice_client.disconnect(force=True)
+                print(f"🔄 移動到語音頻道: {voice_channel.name}")
+                await existing.move_to(voice_channel)
+                await asyncio.sleep(0.5)
+                if existing.is_connected() and existing.channel == voice_channel:
+                    return existing
+            except Exception as e:
+                print(f"⚠️ 移動失敗，改為重新連線: {e}")
+                try:
+                    await existing.disconnect(force=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+        elif existing:
+            try:
+                await existing.disconnect(force=True)
             except Exception:
                 pass
-            await asyncio.sleep(3)
-    
-    # 在連接前，徹底清理所有可能的連接狀態
-    # 檢查 bot.voice_clients 中是否有該 guild 的連接
-    for vc in list(bot.voice_clients):
-        if vc.guild == guild:
+            await asyncio.sleep(1)
+
+        last_error = None
+        for attempt in range(1, 4):
             try:
-                print(f"🧹 清理現有連接: {vc.guild.name}")
-                await vc.disconnect(force=True)
-            except Exception as e:
-                print(f"⚠️ 清理連接時出錯: {e}")
-    
-    # 等待 Discord 完全清理會話（4006 錯誤通常需要更長等待）
-    if retry_count == 0:
-        print("⏳ 等待 Discord 清理會話狀態...")
-        await asyncio.sleep(5)  # 第一次連接前等待 5 秒
-    
-    # 嘗試新連接
-    while retry_count < max_retries:
-        try:
-            print(f"🎤 嘗試連接語音頻道 (第 {retry_count + 1} 次)...")
-            
-            # 在連接前等待（重試時更長）
-            if retry_count > 0:
-                wait_time = 10 + (retry_count * 5)  # 第一次重試 15 秒，之後每次增加 5 秒
-                print(f"⏳ 連接前等待 {wait_time} 秒讓 Discord 清理會話...")
-                await asyncio.sleep(wait_time)
-                
-                # 再次清理可能的殘留連接
+                # Clear any stale guild voice client before a fresh handshake
                 for vc in list(bot.voice_clients):
-                    if vc.guild == guild:
+                    if vc.guild.id == guild.id:
                         try:
                             await vc.disconnect(force=True)
                         except Exception:
                             pass
-                await asyncio.sleep(2)
-            
-            # 使用最簡單的連接方式，讓 discord.py 處理大部分邏輯
-            # 不設置過多參數，使用默認值
-            voice_client = await voice_channel.connect(
-                timeout=60.0,  # 增加超時時間，給 Discord 更多時間處理
-                reconnect=False  # 禁用自動重連
-            )
-            
-            # 等待連接穩定（4006 錯誤後需要更長等待）
-            await asyncio.sleep(5)  # 增加等待時間到 5 秒
-            
-            # 檢查連接狀態
-            if voice_client and voice_client.is_connected():
-                print(f"✅ 語音連接成功: {voice_channel.name}")
-                return voice_client
-            else:
-                raise Exception("Connection not stable after establishment")
-            
-        except discord.errors.ClientException as e:
-            error_msg = str(e).lower()
-            print(f"❌ ClientException: {e}")
-            
-            # 檢查連接是否實際上已經建立
-            await asyncio.sleep(2)  # 等待一下讓連接完成
-            voice_client = guild.voice_client
-            if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
-                print(f"✅ 連接實際上已成功建立: {voice_channel.name}")
-                return voice_client
-            
-            if "already connected" in error_msg:
-                # 如果已經連接，檢查是否在正確的頻道
+
+                if attempt > 1:
+                    wait_time = 3 * attempt
+                    print(f"⏳ 重試前等待 {wait_time} 秒...")
+                    await asyncio.sleep(wait_time)
+
+                print(f"🎤 嘗試連接語音頻道 (第 {attempt}/3 次)...")
+                voice_client = await voice_channel.connect(
+                    timeout=60.0,
+                    reconnect=False,
+                    self_deaf=True,
+                )
+
+                # Brief settle; do not over-wait (long sleeps worsen stale sessions)
+                await asyncio.sleep(1)
                 if voice_client and voice_client.is_connected():
-                    if voice_client.channel == voice_channel:
-                        print(f"✅ 已在正確的頻道: {voice_channel.name}")
-                        return voice_client
-            
-            retry_count += 1
-            if retry_count >= max_retries:
-                # 標記連接失敗
-                connection_failures[guild.id] = True
-                disconnect_reasons[guild.id] = 'connection_failed'
-                
-                # 最後檢查
-                await asyncio.sleep(5)
-                final_check = guild.voice_client
-                if final_check and final_check.is_connected() and final_check.channel == voice_channel:
-                    print(f"✅ 最終檢查：連接已成功建立: {voice_channel.name}")
                     connection_failures.pop(guild.id, None)
                     disconnect_reasons.pop(guild.id, None)
-                    await channel.send(f"✅ 連接已成功建立！儘管出現錯誤訊息，機器人現在已在語音頻道中。\n✅ Connection successful! Despite the error message, the bot is now in the voice channel.")
-                    return final_check
-                
-                # 提供錯誤訊息
-                error_detail = "\n\n⚠️ **WebSocket 4006 錯誤**\n這通常是 Discord 會話管理問題。\n\n**可能的解決方案：**\n1. 等待 1-2 分鐘後再試\n2. 檢查是否有其他 bot 實例在運行\n3. 確認機器人權限正確\n\n⚠️ **WebSocket 4006 Error**\nThis is usually a Discord session management issue.\n\n**Possible solutions:**\n1. Wait 1-2 minutes and try again\n2. Check if other bot instances are running\n3. Verify bot permissions are correct"
-                await channel.send(f"加入語音頻道失敗 (已重試 {max_retries} 次): {e}\nFailed to join voice channel (retried {max_retries} times): {e}{error_detail}")
-                return None
-            
-            # 等待後重試
-            wait_time = 8 if "4006" not in error_msg and "WebSocket" not in error_msg else 15
-            print(f"⏳ 等待 {wait_time} 秒後重試...")
-            await asyncio.sleep(wait_time)
-            
-        except Exception as e:
-            error_msg = str(e)
-            print(f"❌ 語音連接錯誤: {e}")
-            
-            # 檢查連接是否實際上已經建立
-            await asyncio.sleep(3)  # 等待讓連接完成
-            voice_client = guild.voice_client
-            if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
-                print(f"✅ 連接實際上已成功建立: {voice_channel.name}")
-                return voice_client
-            
-            # 特別處理 WebSocket 4006 錯誤
-            if "4006" in error_msg or "WebSocket" in error_msg or "ConnectionClosed" in error_msg:
-                print("⚠️ 檢測到 WebSocket 4006 錯誤（會話無效），進行徹底清理...")
-                
-                # 徹底清理所有可能的連接
-                for vc in list(bot.voice_clients):
-                    if vc.guild == guild:
-                        try:
-                            print(f"🧹 強制清理連接: {vc.guild.name}")
-                            await vc.disconnect(force=True)
-                        except Exception:
-                            pass
-                
-                # 等待更長時間讓 Discord 完全清理會話（4006 需要更長等待）
-                wait_time = 25 + (retry_count * 10)  # 第一次 25 秒，之後每次增加 10 秒
-                print(f"⏳ 等待 {wait_time} 秒讓 Discord 完全清理會話...")
-                await asyncio.sleep(wait_time)
-                
-                # 再次檢查連接狀態（有時 4006 錯誤後連接實際上已建立）
+                    print(f"✅ 語音連接成功: {voice_channel.name}")
+                    return voice_client
+
+                raise RuntimeError("voice client connected flag is false after connect()")
+
+            except Exception as e:
+                last_error = e
+                error_msg = str(e)
+                print(f"❌ 語音連接失敗: {e}")
+
+                # Sometimes Discord finishes the join despite raising
+                await asyncio.sleep(1)
                 voice_client = guild.voice_client
                 if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
-                    print(f"✅ 4006 錯誤後連接已成功建立: {voice_channel.name}")
-                    return voice_client
-            
-            retry_count += 1
-            if retry_count >= max_retries:
-                # 標記連接失敗
-                connection_failures[guild.id] = True
-                disconnect_reasons[guild.id] = 'connection_failed'
-                
-                # 最後檢查
-                await asyncio.sleep(5)
-                final_check = guild.voice_client
-                if final_check and final_check.is_connected() and final_check.channel == voice_channel:
-                    print(f"✅ 最終檢查：連接已成功建立: {voice_channel.name}")
                     connection_failures.pop(guild.id, None)
                     disconnect_reasons.pop(guild.id, None)
-                    await channel.send(f"✅ 連接已成功建立！儘管出現錯誤訊息，機器人現在已在語音頻道中。\n✅ Connection successful! Despite the error message, the bot is now in the voice channel.")
-                    return final_check
-                
-                # 提供錯誤訊息
-                error_detail = "\n\n⚠️ **WebSocket 4006 錯誤**\n這通常是 Discord 會話管理問題。\n\n**可能的解決方案：**\n1. 等待 1-2 分鐘後再試\n2. 檢查是否有其他 bot 實例在運行\n3. 確認機器人權限正確\n\n⚠️ **WebSocket 4006 Error**\nThis is usually a Discord session management issue.\n\n**Possible solutions:**\n1. Wait 1-2 minutes and try again\n2. Check if other bot instances are running\n3. Verify bot permissions are correct"
-                await channel.send(f"加入語音頻道失敗 (已重試 {max_retries} 次): {e}\nFailed to join voice channel (retried {max_retries} times): {e}{error_detail}")
-                return None
-            
-            # 等待後重試
-            wait_time = 8 if "4006" not in error_msg and "WebSocket" not in error_msg and "ConnectionClosed" not in error_msg else 15
-            print(f"⏳ 等待 {wait_time} 秒後重試...")
-            await asyncio.sleep(wait_time)
-    
-    # 最後一次檢查：即使所有重試都失敗，也檢查連接是否已建立
-    print("🔍 進行最後一次連接狀態檢查...")
-    await asyncio.sleep(5)  # 增加等待時間到 5 秒
-    voice_client = guild.voice_client
-    if voice_client and voice_client.is_connected() and voice_client.channel == voice_channel:
-        print(f"✅ 最後檢查：連接已成功建立: {voice_channel.name}")
-        connection_failures.pop(guild.id, None)  # 清除標記
-        disconnect_reasons.pop(guild.id, None)  # 清除原因
-        return voice_client
-    
-    print("❌ 所有重試都失敗，連接未建立")
-    # 確保標記已設置
-    connection_failures[guild.id] = True
-    disconnect_reasons[guild.id] = 'connection_failed'
-    return None
+                    print(f"✅ 連接實際上已成功建立: {voice_channel.name}")
+                    return voice_client
+
+                try:
+                    if guild.voice_client:
+                        await guild.voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+
+                if attempt < 3 and ("4006" in error_msg or "ConnectionClosed" in error_msg or "WebSocket" in error_msg):
+                    # Short backoff only; library upgrade is the real fix
+                    await asyncio.sleep(2 * attempt)
+
+        connection_failures[guild.id] = True
+        disconnect_reasons[guild.id] = 'connection_failed'
+        detail = (
+            "\n\n⚠️ **語音連線失敗**\n"
+            "若持續出現 WebSocket 4006，請確認 Railway 只有 1 個實例，並重新部署最新版本。\n"
+            "⚠️ **Voice connection failed**\n"
+            "If WebSocket 4006 persists, ensure only one Railway replica is running and redeploy."
+        )
+        try:
+            await channel.send(
+                f"加入語音頻道失敗 (已重試 3 次): {last_error}\n"
+                f"Failed to join voice channel (retried 3 times): {last_error}{detail}"
+            )
+        except Exception:
+            pass
+        return None
+
 
 # 用於互動式選單的 View
 class YoutubeSelectView(discord.ui.View):
