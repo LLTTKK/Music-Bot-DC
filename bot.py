@@ -147,6 +147,11 @@ edit_permissions = {}
 # 全域變數：權限冷卻時間管理（每個 guild 一個）
 permission_cooldowns = {}
 
+# Playback control: 'stop' suppresses auto-advance; 'skip' advances once via after-callback
+playback_control_flags = {}
+# Prevent concurrent play_next_song for the same guild
+_play_next_locks = {}
+
 # Per-guild lock to prevent concurrent voice connect attempts (causes 4006)
 _voice_connect_locks = {}
 
@@ -197,11 +202,10 @@ class AdFilterPlayer:
             return
         
         # 創建廣告監控任務
+        # SponsorBlock API returns: {"segment": [start, end], "category": "...", ...}
         for segment in self.sponsor_segments:
-            start_time = segment.get('start', 0)
-            end_time = segment.get('end', 0)
-            
-            if start_time > 0 and end_time > start_time:
+            start_time, end_time = _sponsorblock_bounds(segment)
+            if end_time > start_time >= 0:
                 # 設定定時器來跳過廣告
                 asyncio.create_task(self.schedule_ad_skip(start_time, end_time))
 
@@ -275,18 +279,22 @@ class AdFilterPlayer:
         通知播放下一首歌曲
         """
         try:
-            # 檢查循環播放狀態
+            intent = consume_playback_intent(self.guild.id, default='advance')
+            if intent == 'stop':
+                return
+
+            # 檢查循環播放狀態（skip 時不要循環同一首）
             state = loop_states.get(self.guild.id) or {'enabled': False, 'current_song': None}
             loop_enabled = bool(state.get('enabled'))
-            
-            if loop_enabled and state.get('current_song'):
+
+            if intent != 'skip' and loop_enabled and state.get('current_song'):
                 # 循環播放：重新播放目前歌曲
                 current_song = state['current_song']
                 await self.play_with_ad_filter(current_song)
                 await self.channel.send(f"🔄 循環播放: {current_song['title']}")
                 await log_action(self.guild, f"循環播放 {current_song['title']} (廣告過濾)")
             else:
-                # 正常播放：播放下一首
+                # 正常播放 / skip：播放下一首
                 await play_next_song(self.guild, self.voice_client, self.channel)
         except Exception as e:
             print(f"通知下一首失敗: {e}")
@@ -606,6 +614,19 @@ async def log_action(guild, msg):
 import aiohttp
 import json
 
+
+def _sponsorblock_bounds(segment):
+    """Return (start, end) seconds from a SponsorBlock segment object."""
+    try:
+        raw = segment.get('segment') if isinstance(segment, dict) else None
+        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            return float(raw[0]), float(raw[1])
+        start = (segment or {}).get('start', (segment or {}).get('startTime', 0)) or 0
+        end = (segment or {}).get('end', (segment or {}).get('endTime', 0)) or 0
+        return float(start), float(end)
+    except Exception:
+        return 0.0, 0.0
+
 async def get_sponsorblock_segments(video_id):
     """
     從 SponsorBlock 獲取廣告時間段資訊
@@ -849,30 +870,43 @@ TRUSTED_DOMAINS = [
 # 敏感關鍵字清單
 BLOCKED_KEYWORDS = [
     'hack', 'exploit', 'malware', 'virus', 'trojan',
-    'phishing', 'scam', 'fraud', 'spam', 'bot',
+    'phishing', 'scam', 'fraud', 'spam',
     'ddos', 'dos', 'injection', 'xss', 'csrf'
 ]
 
-def sanitize_input(text):
+def sanitize_input(text, *, is_url=False):
     """
-    清理和轉義使用者輸入
+    清理使用者輸入。
+
+    注意：不要對 URL 做 html.escape，否則 & 會變成 &amp; 導致 YouTube 連結失效。
     """
     if not text:
         return ""
-    
-    # HTML 轉義
-    text = html.escape(text)
-    
+
+    text = str(text)
+
+    # Only HTML-escape plain text, never URLs/queries used by yt-dlp
+    if not is_url:
+        text = html.escape(text)
+
     # Unicode 正規化
     text = unicodedata.normalize('NFKC', text)
-    
-    # 清理多餘空白
-    text = ' '.join(text.split())
-    
+
+    # 清理多餘空白（URL 保留原樣空白處理較保守）
+    if is_url:
+        text = text.strip()
+    else:
+        text = ' '.join(text.split())
+
     # 移除控制字符
     text = ''.join(char for char in text if unicodedata.category(char)[0] != 'C' or char in '\t\n\r ')
-    
+
     return text.strip()
+
+
+def sanitize_url(url):
+    """Sanitize a URL without HTML-escaping query separators."""
+    return sanitize_input(url, is_url=True)
 
 def validate_input_length(text, max_length=None):
     """
@@ -1206,15 +1240,25 @@ def is_currently_playing(guild_id):
         return voice_client.is_playing()
     return False
 
-def stop_current_playback(guild_id):
+def stop_current_playback(guild_id, intent='stop'):
     """
     停止當前播放（統一處理 AdFilterPlayer 和 voice_client）
+
+    intent:
+      - 'stop': do not auto-advance after voice_client.stop()
+      - 'skip': allow after-callback to advance to next song once
     """
+    playback_control_flags[guild_id] = intent
     voice_client = discord.utils.get(bot.voice_clients, guild=bot.get_guild(guild_id))
-    if voice_client and voice_client.is_playing():
+    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
         voice_client.stop()
         return True
     return False
+
+
+def consume_playback_intent(guild_id, default='advance'):
+    """Pop and return the playback intent for a guild."""
+    return playback_control_flags.pop(guild_id, default)
 
 async def connect_to_voice_channel(guild, voice_channel, channel):
     """
@@ -1377,67 +1421,100 @@ class YoutubeSelectView(discord.ui.View):
         self.stop()
 
 async def play_next_song(guild, voice_client, channel):
-    queue = song_queues.get(guild.id, [])
-    if not queue or not voice_client or not voice_client.is_connected():
-        # 佇列空或語音已離線
-        if voice_client and voice_client.is_connected():
-            # 標記為播放完自動離線
-            disconnect_reasons[guild.id] = 'finished'
-            await voice_client.disconnect()
+    lock = _play_next_locks.setdefault(guild.id, asyncio.Lock())
+    if lock.locked():
+        # Another advance is already in progress for this guild
         return
-    
-    # 檢查循環播放狀態（預設不循環）
-    state = loop_states.get(guild.id) or {'enabled': False, 'current_song': None}
-    loop_enabled = bool(state.get('enabled'))
-    
-    if loop_enabled and state.get('current_song'):
-        # 循環播放：重新播放目前歌曲，不影響佇列
-        next_song = state['current_song']
-    else:
-        # 正常播放：從佇列取出下一首
-        next_song = queue.pop(0)
-        song_queues[guild.id] = queue
-        # 記錄目前播放的歌曲（用於按需循環）
-        state['current_song'] = next_song
-        loop_states[guild.id] = state
-    
-    try:
-        # 檢查是否為 YouTube 連結，如果是則使用廣告過濾
-        if 'youtube.com' in next_song['url'] or 'youtu.be' in next_song['url']:
-            # 使用或創建廣告過濾播放器
-            if guild.id not in ad_filter_players:
-                ad_filter_players[guild.id] = AdFilterPlayer(voice_client, guild, channel)
-            
-            ad_filter_player = ad_filter_players[guild.id]
-            await ad_filter_player.play_with_ad_filter(next_song)
-            
-            # 發送播放訊息
-            await channel.send(f"🎵 正在播放（已啟用廣告過濾）: {next_song['title']}")
-            await log_action(guild, f"{next_song['requester']} 已播放 {next_song['title']} (廣告過濾)")
+
+    async with lock:
+        if not voice_client or not voice_client.is_connected():
+            return
+
+        # Loop must be checked BEFORE empty-queue disconnect
+        state = loop_states.get(guild.id) or {'enabled': False, 'current_song': None}
+        loop_enabled = bool(state.get('enabled'))
+
+        if loop_enabled and state.get('current_song'):
+            next_song = state['current_song']
         else:
-            # 非 YouTube 連結使用正常播放
-            player = await YTDLSource.from_url(next_song['url'], loop=bot.loop, stream=True)
-            def after_playing(error):
-                fut = asyncio.run_coroutine_threadsafe(play_next_song(guild, voice_client, channel), bot.loop)
-                try:
-                    fut.result()
-                except Exception as e:
-                    print(f"播放下一首時發生錯誤: {e}")
-            voice_client.play(player, after=after_playing)
-            await channel.send(f"正在播放: {player.title}")
-            await log_action(guild, f"{next_song['requester']} 已播放 {player.title}")
-        # 記錄最後的音樂訊息頻道
-        last_music_channels[guild.id] = channel
-            
-    except Exception as e:
-        await channel.send(f"播放失敗: {e}")
-        await log_action(guild, f"播放失敗: {e}")
-        # 嘗試播放下一首
-        await play_next_song(guild, voice_client, channel)
+            queue = song_queues.get(guild.id, [])
+            if not queue:
+                disconnect_reasons[guild.id] = 'finished'
+                await voice_client.disconnect()
+                return
+            next_song = queue.pop(0)
+            song_queues[guild.id] = queue
+            # 記錄目前播放的歌曲（用於按需循環）
+            state['current_song'] = next_song
+            loop_states[guild.id] = state
+
+        try:
+            # 檢查是否為 YouTube 連結，如果是則使用廣告過濾
+            if 'youtube.com' in next_song['url'] or 'youtu.be' in next_song['url']:
+                if guild.id not in ad_filter_players:
+                    ad_filter_players[guild.id] = AdFilterPlayer(voice_client, guild, channel)
+
+                ad_filter_player = ad_filter_players[guild.id]
+                await ad_filter_player.play_with_ad_filter(next_song)
+
+                await channel.send(f"🎵 正在播放（已啟用廣告過濾）: {next_song['title']}")
+                await log_action(guild, f"{next_song['requester']} 已播放 {next_song['title']} (廣告過濾)")
+            else:
+                player = await YTDLSource.from_url(next_song['url'], loop=bot.loop, stream=True)
+
+                def after_playing(error):
+                    if error:
+                        print(f"播放錯誤: {error}")
+
+                    async def _advance():
+                        intent = consume_playback_intent(guild.id, default='advance')
+                        if intent == 'stop':
+                            return
+                        # skip/advance both go to next; skip disables same-song loop in notify path,
+                        # here loop is handled at top of play_next_song unless intent == skip
+                        if intent == 'skip':
+                            # Temporarily disable loop for this advance
+                            state = loop_states.get(guild.id) or {}
+                            was = bool(state.get('enabled'))
+                            if was:
+                                state = dict(state)
+                                state['enabled'] = False
+                                loop_states[guild.id] = state
+                            try:
+                                await play_next_song(guild, voice_client, channel)
+                            finally:
+                                if was:
+                                    state = loop_states.get(guild.id) or {}
+                                    state['enabled'] = True
+                                    loop_states[guild.id] = state
+                        else:
+                            await play_next_song(guild, voice_client, channel)
+
+                    try:
+                        asyncio.run_coroutine_threadsafe(_advance(), bot.loop)
+                    except Exception as e:
+                        print(f"播放下一首時發生錯誤: {e}")
+
+                voice_client.play(player, after=after_playing)
+                await channel.send(f"正在播放: {player.title}")
+                await log_action(guild, f"{next_song['requester']} 已播放 {player.title}")
+            # 記錄最後的音樂訊息頻道
+            last_music_channels[guild.id] = channel
+
+        except Exception as e:
+            await channel.send(f"播放失敗: {e}")
+            await log_action(guild, f"播放失敗: {e}")
+            # 嘗試播放下一首
+            await play_next_song(guild, voice_client, channel)
+
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
+        return
+
+    # Ignore DMs (message.guild is None)
+    if message.guild is None:
         return
 
     # 檢查伺服器限制
@@ -1449,6 +1526,7 @@ async def on_message(message):
         return  # 忽略非指定頻道的訊息
 
     content = message.content.strip()
+    handled = False
     
     # 處理 [? url ...] 指令
     if content.startswith('[? url'):
@@ -1460,7 +1538,7 @@ async def on_message(message):
         url = parts[2]
         
         # 安全驗證
-        cleaned_url = sanitize_input(url)
+        cleaned_url = sanitize_url(url)
         
         # 長度檢查
         if not validate_input_length(cleaned_url, SECURITY_CONFIG['max_url_length']):
@@ -1880,10 +1958,11 @@ async def on_message(message):
 
     # 直接在 on_message 中處理停止播放（提升在播放期間的可靠度）
     elif content.startswith('[? stop') or content == '[? stop' or content.startswith('[stop') or content == '[stop':
+        handled = True
         voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
         if voice_client and voice_client.is_connected():
             if is_currently_playing(message.guild.id):
-                stop_current_playback(message.guild.id)
+                stop_current_playback(message.guild.id, intent='stop')
                 await message.channel.send("已停止播放。\nPlayback stopped.")
                 await log_action(message.guild, f"{message.author.display_name} 使用訊息事件停止播放")
             else:
@@ -1893,6 +1972,7 @@ async def on_message(message):
 
     # 直接在 on_message 中處理跳過（提升在播放期間的可靠度）
     elif content.startswith('[? skip') or content.startswith('[skip') or content.startswith('[ skip'):
+        handled = True
         voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
         if not voice_client or not voice_client.is_connected():
             await message.channel.send("機器人未在語音頻道。")
@@ -1906,7 +1986,7 @@ async def on_message(message):
             queue = song_queues.get(message.guild.id, [])
             if num == 1:
                 if is_currently_playing(message.guild.id):
-                    stop_current_playback(message.guild.id)
+                    stop_current_playback(message.guild.id, intent='skip')
                     await message.channel.send("⏭️ 已跳過目前播放的歌曲。\n⏭️ Skipped the currently playing song.")
                     await log_action(message.guild, f"{message.author.display_name} 使用訊息事件跳過 1 首歌曲")
                 else:
@@ -1915,8 +1995,9 @@ async def on_message(message):
                 if num > len(queue) + 1:
                     await message.channel.send(f"❌ 佇列中只有 {len(queue)} 首歌曲，無法跳過 {num} 首。\n❌ There are only {len(queue)} songs in queue, cannot skip {num} songs.")
                 else:
+                    # Suppress after-callback, then advance once ourselves
                     if is_currently_playing(message.guild.id):
-                        stop_current_playback(message.guild.id)
+                        stop_current_playback(message.guild.id, intent='stop')
                     songs_to_skip = num - 1
                     skipped = queue[:songs_to_skip]
                     song_queues[message.guild.id] = queue[songs_to_skip:]
@@ -1927,14 +2008,16 @@ async def on_message(message):
                         await message.channel.send(f"⏭️ 已跳過 {num} 首歌曲。")
                     await log_action(message.guild, f"{message.author.display_name} 使用訊息事件跳過 {num} 首歌曲")
                     if song_queues[message.guild.id]:
+                        await asyncio.sleep(0.2)
                         await play_next_song(message.guild, voice_client, message.channel)
 
     # 處理 [? dc] 指令（在 on_message 中提供同功能斷線）
     elif content.startswith('[? dc') or content.startswith('[dc') or content.startswith('[ dc'):
+        handled = True
         voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
         if voice_client and voice_client.is_connected():
             if is_currently_playing(message.guild.id):
-                stop_current_playback(message.guild.id)
+                stop_current_playback(message.guild.id, intent='stop')
             song_queues[message.guild.id] = []
             disconnect_reasons[message.guild.id] = 'user_dc'
             await voice_client.disconnect()
@@ -1945,6 +2028,7 @@ async def on_message(message):
 
     # 處理 [? loop] 指令（在 on_message 中提供同功能）
     elif content.startswith('[? loop') or content.startswith('[loop') or content.startswith('[ loop'):
+        handled = True
         voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
         if not voice_client or not voice_client.is_connected():
             await message.channel.send("機器人未在語音頻道。\nBot is not in a voice channel.")
@@ -1967,27 +2051,26 @@ async def on_message(message):
 
     # 處理 [? notloop] 指令（在 on_message 中提供同功能）
     elif content.startswith('[? notloop') or content.startswith('[notloop') or content.startswith('[ notloop'):
-            voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
-            if not voice_client or not voice_client.is_connected():
-                await message.channel.send("機器人未在語音頻道。\nBot is not in a voice channel.")
-                return
-            
-            # 停用循環播放
-            if message.guild.id in loop_states:
-                state = loop_states.get(message.guild.id) or {}
-                was_enabled = state.get('enabled', False)
-                state['enabled'] = False
-                loop_states[message.guild.id] = state
-                
-                if was_enabled:
-                    await message.channel.send("⏹️ **循環播放已停用**\n當前歌曲播放完畢後將播放佇列中的下一首歌曲。\n⏹️ **Loop playback disabled**\nCurrent song will finish, then play next song in queue.")
-                    await log_action(message.guild, f"{message.author.display_name} 使用訊息事件停用循環播放")
-                else:
-                    await message.channel.send("❌ 循環播放本來就沒有啟用。\n❌ Loop playback was not enabled.")
+        handled = True
+        voice_client = discord.utils.get(bot.voice_clients, guild=message.guild)
+        if not voice_client or not voice_client.is_connected():
+            await message.channel.send("機器人未在語音頻道。\nBot is not in a voice channel.")
+        elif message.guild.id in loop_states:
+            state = loop_states.get(message.guild.id) or {}
+            was_enabled = state.get('enabled', False)
+            state['enabled'] = False
+            loop_states[message.guild.id] = state
+
+            if was_enabled:
+                await message.channel.send("⏹️ **循環播放已停用**\n當前歌曲播放完畢後將播放佇列中的下一首歌曲。\n⏹️ **Loop playback disabled**\nCurrent song will finish, then play next song in queue.")
+                await log_action(message.guild, f"{message.author.display_name} 使用訊息事件停用循環播放")
             else:
                 await message.channel.send("❌ 循環播放本來就沒有啟用。\n❌ Loop playback was not enabled.")
+        else:
+            await message.channel.send("❌ 循環播放本來就沒有啟用。\n❌ Loop playback was not enabled.")
 
-    await bot.process_commands(message)
+    if not handled:
+        await bot.process_commands(message)
 
 # 停止播放指令
 @bot.command(name="stop")
@@ -1996,7 +2079,7 @@ async def stop(ctx):
     voice_client = discord.utils.get(bot.voice_clients, guild=ctx.guild)
     if voice_client and voice_client.is_connected():
         if is_currently_playing(ctx.guild.id):
-            stop_current_playback(ctx.guild.id)
+            stop_current_playback(ctx.guild.id, intent='stop')
             await ctx.send("已停止播放。\nPlayback stopped.")
             await log_action(ctx.guild, f"{ctx.author.display_name} 已停止播放")
         else:
@@ -2226,9 +2309,9 @@ async def skip_songs(ctx, number: int = 1):
         return
     
     if number == 1:
-        # 跳過目前播放的歌曲
+        # 跳過目前播放的歌曲（after-callback 會播下一首）
         if is_currently_playing(ctx.guild.id):
-            stop_current_playback(ctx.guild.id)
+            stop_current_playback(ctx.guild.id, intent='skip')
             await ctx.send("⏭️ 已跳過目前播放的歌曲。\n⏭️ Skipped the currently playing song.")
             await log_action(ctx.guild, f"{ctx.author.display_name} 已跳過目前播放的歌曲")
         else:
@@ -2240,9 +2323,9 @@ async def skip_songs(ctx, number: int = 1):
         await ctx.send(f"❌ 佇列中只有 {len(queue)} 首歌曲，無法跳過 {number} 首。\n❌ There are only {len(queue)} songs in queue, cannot skip {number} songs.")
         return
     
-    # 停止目前播放
+    # 停止目前播放，抑制 after-callback，稍後自行播下一首
     if is_currently_playing(ctx.guild.id):
-        stop_current_playback(ctx.guild.id)
+        stop_current_playback(ctx.guild.id, intent='stop')
     
     # 從佇列中移除要跳過的歌曲
     songs_to_skip = number - 1  # 減1是因為已經停止了目前播放的歌曲
@@ -2261,8 +2344,9 @@ async def skip_songs(ctx, number: int = 1):
         await ctx.send(f"⏭️ 已跳過 {number} 首歌曲。")
         await log_action(ctx.guild, f"{ctx.author.display_name} 已跳過 {number} 首歌曲")
     
-    # 如果佇列還有歌曲，開始播放下一首
+    # 如果佇列還有歌曲，開始播放下一首（只呼叫一次）
     if song_queues[ctx.guild.id]:
+        await asyncio.sleep(0.2)
         await play_next_song(ctx.guild, voice_client, ctx.channel)
 
 # 斷線並清空佇列指令
@@ -2273,7 +2357,7 @@ async def disconnect_bot(ctx):
     if voice_client and voice_client.is_connected():
         # 停止播放
         if is_currently_playing(ctx.guild.id):
-            stop_current_playback(ctx.guild.id)
+            stop_current_playback(ctx.guild.id, intent='stop')
         # 清空佇列
         song_queues[ctx.guild.id] = []
         # 離開語音頻道（標記為使用者要求）
@@ -2355,15 +2439,16 @@ async def edit_playlist(ctx, action: str, *args):
             queue.insert(0, song)
             song_queues[ctx.guild.id] = queue
             
-            # 停止目前播放並開始新歌曲
-            if voice_client.is_playing():
-                voice_client.stop()
+            # 停止目前播放並開始新歌曲（抑制 after-callback，避免播兩次）
+            if voice_client.is_playing() or voice_client.is_paused():
+                stop_current_playback(ctx.guild.id, intent='stop')
             
             await ctx.send(f"🎵 **立即播放！**\n"
                            f"正在播放：{song['title']}\n"
                            f"📍 從第 {position} 位移動到第 1 位")
             
-            # 開始播放
+            # 開始播放（只呼叫一次）
+            await asyncio.sleep(0.2)
             await play_next_song(ctx.guild, voice_client, ctx.channel)
             
         elif action.lower() == "remove":
@@ -2587,12 +2672,15 @@ async def reboot_bot(ctx):
     # 延遲一下讓訊息發送完成
     await asyncio.sleep(2)
     
-    # 重啟 bot
+    # 重啟 bot：非 0 結束碼才能觸發 Railway ON_FAILURE / ALWAYS 重啟
     try:
         await bot.close()
     except Exception as e:
         print(f"重啟失敗: {e}")
         await ctx.send("❌ 重啟失敗，請手動重啟 environment。")
+    finally:
+        import os
+        os._exit(1)
 
 if __name__ == "__main__":
     # 驗證環境變數
